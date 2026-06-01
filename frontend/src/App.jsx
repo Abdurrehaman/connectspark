@@ -32,6 +32,8 @@ function App() {
   
   const [hasVideo, setHasVideo] = useState(true);
   const [hasAudio, setHasAudio] = useState(true);
+  const [localFlipped, setLocalFlipped] = useState(true);
+  const [remoteFlipped, setRemoteFlipped] = useState(false);
 
   const [walletBalance, setWalletBalance] = useState(0);
 
@@ -573,20 +575,38 @@ function App() {
         <div className="videos-container">
           <div className="video-box">
             <span className="video-label">You</span>
-            <video ref={localVideoRef} autoPlay playsInline muted style={{ transform: 'scaleX(-1)' }} onLoadedMetadata={(e) => e.target.play().catch(console.error)}></video>
+            <video
+              ref={localVideoRef}
+              autoPlay playsInline muted
+              style={{ transform: localFlipped ? 'scaleX(-1)' : 'scaleX(1)', transition: 'transform 0.3s ease' }}
+              onLoadedMetadata={(e) => e.target.play().catch(console.error)}
+            ></video>
             <div className="media-controls">
-              <button className="circle-btn" onClick={toggleVideo}>
+              <button className="circle-btn" onClick={toggleVideo} title={hasVideo ? 'Turn off camera' : 'Turn on camera'}>
                 {hasVideo ? <Video size={16} /> : <VideoOff size={16} color="#ef4444" />}
               </button>
-              <button className="circle-btn" onClick={toggleAudio}>
+              <button className="circle-btn" onClick={toggleAudio} title={hasAudio ? 'Mute' : 'Unmute'}>
                 {hasAudio ? <Mic size={16} /> : <MicOff size={16} color="#ef4444" />}
+              </button>
+              <button className="circle-btn flip-btn" onClick={() => setLocalFlipped(f => !f)} title="Flip video">
+                🔄
               </button>
             </div>
           </div>
           
           <div className="video-box">
             <span className="video-label">Stranger</span>
-            <video ref={remoteVideoRef} autoPlay playsInline onLoadedMetadata={(e) => e.target.play().catch(console.error)}></video>
+            <video
+              ref={remoteVideoRef}
+              autoPlay playsInline
+              style={{ transform: remoteFlipped ? 'scaleX(-1)' : 'scaleX(1)', transition: 'transform 0.3s ease' }}
+              onLoadedMetadata={(e) => e.target.play().catch(console.error)}
+            ></video>
+            <div className="media-controls">
+              <button className="circle-btn flip-btn" onClick={() => setRemoteFlipped(f => !f)} title="Flip video">
+                🔄
+              </button>
+            </div>
           </div>
         </div>
 
