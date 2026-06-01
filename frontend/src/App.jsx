@@ -573,7 +573,7 @@ function App() {
         <div className="videos-container">
           <div className="video-box">
             <span className="video-label">You</span>
-            <video ref={localVideoRef} autoPlay playsInline muted onLoadedMetadata={(e) => e.target.play().catch(console.error)}></video>
+            <video ref={localVideoRef} autoPlay playsInline muted style={{ transform: 'scaleX(-1)' }} onLoadedMetadata={(e) => e.target.play().catch(console.error)}></video>
             <div className="media-controls">
               <button className="circle-btn" onClick={toggleVideo}>
                 {hasVideo ? <Video size={16} /> : <VideoOff size={16} color="#ef4444" />}
