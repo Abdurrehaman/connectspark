@@ -613,38 +613,91 @@ body {
   justify-content: center;
 }
 
-.loader {
-  width: 60px; height: 60px;
-  border: 4px solid rgba(255,255,255,0.1);
-  border-left-color: #f43f5e;
-  border-radius: 50%;
-  animation: spin 1s linear infinite;
-  margin-bottom: 1rem;
-}
-
-.ad-container {
-  margin-top: 30px;
-  width: 320px;
-  height: 100px;
-  background: rgba(255,255,255,0.1);
-  border: 1px dashed rgba(255,255,255,0.3);
-  border-radius: 12px;
+.search-animation {
+  position: relative;
+  width: 120px;
+  height: 120px;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  position: relative;
+  margin-bottom: 2rem;
 }
-.ad-label {
+
+.pulse-ring {
   position: absolute;
-  top: 5px;
-  right: 10px;
-  font-size: 0.7rem;
-  color: #94a3b8;
-  text-transform: uppercase;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  border: 2px solid #f43f5e;
+  animation: pulseRing 2s ease-out infinite;
+  opacity: 0;
 }
-.ad-content h3 { font-size: 1.1rem; color: #cbd5e1; }
-.ad-content p { font-size: 0.8rem; color: #94a3b8; }
+
+.pulse-ring.delay-1 { animation-delay: 0.6s; }
+.pulse-ring.delay-2 { animation-delay: 1.2s; }
+
+@keyframes pulseRing {
+  0% { transform: scale(0.3); opacity: 0.8; }
+  100% { transform: scale(2); opacity: 0; }
+}
+
+.search-icon {
+  font-size: 3rem;
+  z-index: 2;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.search-title {
+  font-size: 2rem;
+  font-weight: 800;
+  background: linear-gradient(to right, #fb7185, #f43f5e);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 0.5rem;
+}
+
+.search-subtitle {
+  color: #94a3b8;
+  font-size: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.search-dots {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 2rem;
+}
+
+.search-dots span {
+  width: 10px;
+  height: 10px;
+  background: #f43f5e;
+  border-radius: 50%;
+  animation: bounce 1.2s ease-in-out infinite;
+}
+
+.search-dots span:nth-child(2) { animation-delay: 0.2s; }
+.search-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); opacity: 0.4; }
+  50% { transform: translateY(-12px); opacity: 1; }
+}
+
+.search-tips {
+  background: rgba(244, 63, 94, 0.1);
+  border: 1px solid rgba(244, 63, 94, 0.3);
+  border-radius: 16px;
+  padding: 12px 20px;
+  max-width: 360px;
+  text-align: center;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+}
+
+.search-tips strong {
+  color: #fb7185;
+}
 
 .mutual-spark-overlay {
   position: absolute;

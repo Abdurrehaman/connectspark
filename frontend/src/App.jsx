@@ -616,15 +616,19 @@ function App() {
         {/* Match / Wait Overlays */}
         {isMatching && (
           <div className="status-overlay">
-            <div className="loader"></div>
-            <h2>Finding your vibe...</h2>
-            {/* Loading Screen Ad Placeholder */}
-            <div className="ad-container">
-               <span className="ad-label">Advertisement</span>
-               <div className="ad-content">
-                  <h3>Your Ad Here</h3>
-                  <p>Reach thousands of active users!</p>
-               </div>
+            <div className="search-animation">
+              <div className="pulse-ring"></div>
+              <div className="pulse-ring delay-1"></div>
+              <div className="pulse-ring delay-2"></div>
+              <div className="search-icon">⚡</div>
+            </div>
+            <h2 className="search-title">Finding your vibe...</h2>
+            <p className="search-subtitle">Scanning the planet for your perfect match</p>
+            <div className="search-dots">
+              <span></span><span></span><span></span>
+            </div>
+            <div className="search-tips">
+              <p>💡 Tip: Use <strong>Super Spark</strong> to jump to the front of the queue!</p>
             </div>
           </div>
         )}
