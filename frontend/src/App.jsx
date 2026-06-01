@@ -84,78 +84,91 @@ function App() {
   };
 
   const handleTopUp = async () => {
-    const amount = 100; // Flat ₹100 top up
+    const amount = 100;
     try {
+      // Step 1: Create order on backend
       const res = await fetch(`${SOCKET_SERVER_URL}/api/create-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ amount })
       });
       const order = await res.json();
-
-      const resLoad = await loadRazorpay();
-      if (!resLoad) {
-        alert("Razorpay SDK failed to load. Simulating success for testing.");
-        const fakeVerifyRes = await fetch(`${SOCKET_SERVER_URL}/api/wallet/verify-funds`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId,
-            amount,
-            razorpay_order_id: 'mock',
-            razorpay_payment_id: 'mock',
-            razorpay_signature: 'mock'
-          })
-        });
-        const fakeVerifyData = await fakeVerifyRes.json();
-        if (fakeVerifyData.success) {
-          setWalletBalance(prev => prev + amount);
-          alert(`Successfully added ₹${amount} to your Prime Balance!`);
-        }
+      if (!order.order_id) {
+        alert("Failed to create payment order. Please try again.");
         return;
       }
 
+      // Step 2: Load Razorpay checkout script
+      await loadRazorpay();
+      if (!window.Razorpay) {
+        alert("Razorpay failed to load. Please check your internet connection.");
+        return;
+      }
+
+      // Step 3: Open Razorpay modal
       const options = {
-        key: 'rzp_test_mock_key',
+        key: import.meta.env.VITE_RAZORPAY_KEY_ID,
         amount: order.amount,
         currency: order.currency,
         name: 'ConnectSpark',
-        description: 'Prime Subscription Top-Up',
-        order_id: order.id,
+        description: 'Prime Balance Top-Up ₹100',
+        order_id: order.order_id,
         handler: async function (response) {
-          const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/wallet/verify-funds`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId,
-              amount,
-              razorpay_order_id: response.razorpay_order_id,
-              razorpay_payment_id: response.razorpay_payment_id,
-              razorpay_signature: response.razorpay_signature
-            })
-          });
-          const verifyData = await verifyRes.json();
-          if (verifyData.success) {
-            setWalletBalance(prev => prev + amount);
-            alert(`Successfully added ₹${amount} to your Prime Balance!`);
-          } else {
-            alert("Payment verification failed.");
+          // Step 4: Verify payment on backend
+          try {
+            const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/verify-payment`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature
+              })
+            });
+            const verifyData = await verifyRes.json();
+            if (verifyData.success) {
+              // Step 5: Credit wallet
+              const fundRes = await fetch(`${SOCKET_SERVER_URL}/api/wallet/verify-funds`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  userId,
+                  amount,
+                  razorpay_order_id: response.razorpay_order_id,
+                  razorpay_payment_id: response.razorpay_payment_id,
+                  razorpay_signature: response.razorpay_signature
+                })
+              });
+              const fundData = await fundRes.json();
+              if (fundData.success) {
+                setWalletBalance(prev => prev + amount);
+                alert(`✅ ₹${amount} added to your Prime Balance!`);
+              }
+            } else {
+              alert(`❌ Payment verification failed: ${verifyData.message}`);
+            }
+          } catch (err) {
+            alert("Error verifying payment. Please contact support.");
           }
         },
-        prefill: { name: 'Anonymous User', email: 'user@example.com', contact: '9999999999' },
+        modal: {
+          ondismiss: function () {
+            console.log('User closed the payment modal.');
+          }
+        },
+        prefill: { name: 'ConnectSpark User', email: 'user@connectspark.app', contact: '9999999999' },
         theme: { color: '#f43f5e' }
       };
 
       const paymentObject = new window.Razorpay(options);
-      try {
-        paymentObject.open();
-      } catch (e) {
-        console.log("Mock payment fallback");
-      }
+      paymentObject.on('payment.failed', function (response) {
+        alert(`Payment failed: ${response.error.description}`);
+      });
+      paymentObject.open();
 
     } catch (err) {
       console.error(err);
-      alert("Error processing payment.");
+      alert("Error initialising payment. Please try again.");
     }
   };
 
