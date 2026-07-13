@@ -3,7 +3,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 
@@ -11,34 +11,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize SQLite Database
-const db = new sqlite3.Database('./database.db', (err) => {
-  if (err) {
-    console.error('Error connecting to SQLite:', err.message);
-  } else {
-    console.log('Connected to the SQLite database.');
-    
-    // Create tables
-    db.run(`CREATE TABLE IF NOT EXISTS reports (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      reported_ip TEXT,
-      reporter_ip TEXT,
-      reason TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS bans (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ip TEXT UNIQUE,
-      banned_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS wallets (
-      user_id TEXT PRIMARY KEY,
-      balance INTEGER DEFAULT 0
-    )`);
-  }
+// Initialize PostgreSQL (Supabase)
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
+
+db.connect()
+  .then(() => console.log('Connected to Supabase PostgreSQL ✅'))
+  .catch(err => console.error('Database connection error:', err.message));
 
 // Initialize Razorpay
 // Note: In production, these should be real keys in a .env file.
@@ -49,22 +30,20 @@ const razorpay = new Razorpay({
 
 // Payment Endpoints
 app.post('/api/create-order', async (req, res) => {
-  const { amount } = req.body; // Amount in INR (e.g. 2 for ₹2, 20 for ₹20)
+  const { amount } = req.body; // Amount in INR
   
+  if (!amount || amount * 100 < 100) {
+    return res.status(400).json({ error: "Minimum amount is ₹1 (100 paise)" });
+  }
+
   try {
     const options = {
-      amount: amount * 100, // Razorpay takes amount in paise (1 INR = 100 paise)
+      amount: Math.round(amount * 100), // Convert to paise
       currency: "INR",
-      receipt: "receipt_order_" + Date.now(),
+      receipt: "receipt_" + Date.now(),
     };
-    
-    // Since we are mocking if keys are not real, we will return a mock order if it fails
-    if (razorpay.key_id === 'rzp_test_mock_key') {
-      return res.json({ id: "order_mock_" + Date.now(), amount: options.amount, currency: "INR" });
-    }
-    
     const order = await razorpay.orders.create(options);
-    res.json(order);
+    res.json({ order_id: order.id, amount: order.amount, currency: order.currency });
   } catch (err) {
     console.error("Payment Order Error:", err);
     res.status(500).json({ error: err.message });
@@ -73,83 +52,80 @@ app.post('/api/create-order', async (req, res) => {
 
 app.post('/api/verify-payment', (req, res) => {
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-  
-  if (razorpay.key_id === 'rzp_test_mock_key') {
-    // Always succeed in mock mode
-    return res.json({ success: true });
+
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ success: false, message: "Missing required payment fields" });
   }
   
   const sign = razorpay_order_id + "|" + razorpay_payment_id;
   const expectedSign = crypto
     .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(sign.toString())
+    .update(sign)
     .digest("hex");
 
   if (razorpay_signature === expectedSign) {
     return res.json({ success: true, message: "Payment verified successfully" });
   } else {
-    return res.status(400).json({ success: false, message: "Invalid signature" });
+    return res.status(400).json({ success: false, message: "Signature mismatch — payment not verified" });
   }
 });
 
-app.get('/api/wallet/balance/:userId', (req, res) => {
+app.get('/api/wallet/balance/:userId', async (req, res) => {
   const { userId } = req.params;
   if (!userId) return res.status(400).json({ error: "No user ID" });
   
-  db.get(`SELECT balance FROM wallets WHERE user_id = ?`, [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) {
-      // Create wallet if it doesn't exist
-      db.run(`INSERT INTO wallets (user_id, balance) VALUES (?, ?)`, [userId, 0]);
+  try {
+    const result = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
+    if (result.rows.length === 0) {
+      await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING', [userId]);
       return res.json({ balance: 0 });
     }
-    res.json({ balance: row.balance });
-  });
+    res.json({ balance: result.rows[0].balance });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/api/wallet/verify-funds', (req, res) => {
+app.post('/api/wallet/verify-funds', async (req, res) => {
   const { userId, amount, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-  
-  // Quick mock verify
-  let success = false;
-  if (razorpay.key_id === 'rzp_test_mock_key') {
-    success = true;
-  } else {
-    const sign = razorpay_order_id + "|" + razorpay_payment_id;
-    const expectedSign = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(sign.toString()).digest("hex");
-    success = (razorpay_signature === expectedSign);
+
+  const sign = razorpay_order_id + "|" + razorpay_payment_id;
+  const expectedSign = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(sign).digest("hex");
+
+  if (razorpay_signature !== expectedSign) {
+    return res.status(400).json({ success: false, message: "Invalid signature" });
   }
 
-  if (success) {
-    // Add funds
-    db.run(`INSERT INTO wallets (user_id, balance) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?`, 
-      [userId, amount, amount], 
-      (err) => {
-        if (err) return res.status(500).json({ success: false, error: err.message });
-        res.json({ success: true, added: amount });
-      }
+  try {
+    await db.query(
+      `INSERT INTO wallets (user_id, balance) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()`,
+      [userId, amount]
     );
-  } else {
-    res.status(400).json({ success: false, message: "Invalid signature" });
+    res.json({ success: true, added: amount });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post('/api/wallet/deduct', (req, res) => {
+app.post('/api/wallet/deduct', async (req, res) => {
   const { userId, amount } = req.body;
   
-  db.get(`SELECT balance FROM wallets WHERE user_id = ?`, [userId], (err, row) => {
-    if (err) return res.status(500).json({ success: false, message: "Database error" });
+  try {
+    const result = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
+    const currentBalance = result.rows.length > 0 ? result.rows[0].balance : 0;
     
-    const currentBalance = row ? row.balance : 0;
-    if (currentBalance >= amount) {
-      db.run(`UPDATE wallets SET balance = balance - ? WHERE user_id = ?`, [amount, userId], function(err) {
-        if (err) return res.status(500).json({ success: false, message: "Transaction failed" });
-        res.json({ success: true, newBalance: currentBalance - amount });
-      });
-    } else {
-      res.status(400).json({ success: false, message: "Insufficient Prime Balance" });
+    if (currentBalance < amount) {
+      return res.status(400).json({ success: false, message: "Insufficient Prime Balance" });
     }
-  });
+    await db.query(
+      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2',
+      [amount, userId]
+    );
+    res.json({ success: true, newBalance: currentBalance - amount });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 const server = http.createServer(app);
@@ -189,16 +165,20 @@ const getRandomIcebreaker = (vibe) => {
   return list[Math.floor(Math.random() * list.length)];
 };
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   const userIp = socket.handshake.address;
 
   // Check if banned
-  db.get(`SELECT ip FROM bans WHERE ip = ?`, [userIp], (err, row) => {
-    if (row) {
+  try {
+    const banResult = await db.query('SELECT ip FROM bans WHERE ip = $1', [userIp]);
+    if (banResult.rows.length > 0) {
       socket.emit('banned', { message: "You are banned from the platform." });
       socket.disconnect(true);
+      return;
     }
-  });
+  } catch (err) {
+    console.error('Ban check error:', err.message);
+  }
 
   connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp });
 
@@ -342,37 +322,36 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('report', (data) => {
-      const user = connectedUsers.get(socket.id);
-      if (!user || !user.currentPartner) return;
-      
-      const reportedUser = connectedUsers.get(user.currentPartner);
-      if (!reportedUser) return;
+  socket.on('report', async (data) => {
+    const user = connectedUsers.get(socket.id);
+    if (!user || !user.currentPartner) return;
 
-      const reportedIp = reportedUser.ip;
-      const reporterIp = user.ip;
+    const reportedUser = connectedUsers.get(user.currentPartner);
+    if (!reportedUser) return;
 
-      // Log report in DB
-      db.run(`INSERT INTO reports (reported_ip, reporter_ip, reason) VALUES (?, ?, ?)`, 
-        [reportedIp, reporterIp, data.reason], 
-        function(err) {
-          if (err) return console.error(err);
-          
-          // Check if they reached the ban threshold (3 reports)
-          db.get(`SELECT COUNT(*) as count FROM reports WHERE reported_ip = ?`, [reportedIp], (err, row) => {
-            if (row && row.count >= 3) {
-              db.run(`INSERT OR IGNORE INTO bans (ip) VALUES (?)`, [reportedIp], (err) => {
-                if (!err) {
-                  console.log(`[BAN] IP ${reportedIp} has been permanently banned.`);
-                  // Disconnect them immediately
-                  io.to(user.currentPartner).emit('banned', { message: "You have been banned for multiple reports." });
-                  io.sockets.sockets.get(user.currentPartner)?.disconnect(true);
-                }
-              });
-            }
-          });
-        }
+    const reportedIp = reportedUser.ip;
+    const reporterIp = user.ip;
+
+    try {
+      await db.query(
+        'INSERT INTO reports (reported_ip, reporter_ip, reason) VALUES ($1, $2, $3)',
+        [reportedIp, reporterIp, data.reason]
       );
+
+      const countResult = await db.query(
+        'SELECT COUNT(*) as count FROM reports WHERE reported_ip = $1',
+        [reportedIp]
+      );
+
+      if (parseInt(countResult.rows[0].count) >= 3) {
+        await db.query('INSERT INTO bans (ip) VALUES ($1) ON CONFLICT (ip) DO NOTHING', [reportedIp]);
+        console.log(`[BAN] IP ${reportedIp} permanently banned.`);
+        io.to(user.currentPartner).emit('banned', { message: "You have been banned for multiple reports." });
+        io.sockets.sockets.get(user.currentPartner)?.disconnect(true);
+      }
+    } catch (err) {
+      console.error('Report error:', err.message);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -382,5 +361,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+  console.log(`ConnectSpark backend running on port ${PORT} 🚀`);
 });
