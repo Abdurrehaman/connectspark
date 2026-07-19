@@ -127,22 +127,29 @@ app.post('/api/wallet/deduct', async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 const queues = {
   'soul_search': [],
   'flirt': [],
-  'after_hours': []
+  'after_hours': [],
+  'global': []
 };
 
-// ... [Keep Icebreakers exactly the same]
+const DARE_CARDS = [
+  { text: "Show the weirdest thing in your room right now!" },
+  { text: "Do your best celebrity impression!" },
+  { text: "Sing the first line of any song!" },
+  { text: "Show us your best dance move!" },
+  { text: "Tell us the most embarrassing thing that happened to you this week." },
+  { text: "Do 5 push-ups on camera!" },
+  { text: "Show your phone's most recent photo (no deleting allowed!)" },
+  { text: "Speak in an accent for the next 2 minutes!" },
+];
+
 const icebreakers = {
   'soul_search': [
     { text: "What's a life lesson you learned the hard way?", answers: ["That you can't pour from an empty cup—self-care isn't selfish.", "Not everyone who smiles at you is your friend.", "Sometimes, peace is better than being right."] },
@@ -155,14 +162,39 @@ const icebreakers = {
   'after_hours': [
     { text: "What's a secret fantasy you've never told anyone?", answers: ["Getting caught doing something risky in public.", "A weekend getaway with zero inhibitions and no rules.", "Roleplaying a complete stranger in a fancy hotel bar."] },
     { text: "What's your biggest guilty pleasure?", answers: ["Binge-watching trashy reality TV all night.", "Eating a whole tub of ice cream in bed.", "Listening to 2000s boy bands unironically."] }
+  ],
+  'global': [
+    { text: "What's one thing your country does better than anywhere else?", answers: ["The food — nothing beats home cooking!", "The hospitality — strangers become friends fast.", "The festivals — nothing compares to our celebrations!"] },
+    { text: "What is one thing you wish people knew about your culture?", answers: ["We're much more open-minded than stereotypes suggest.", "Family is everything — it shapes who we are.", "Our music and art are world class, just underrated globally."] }
   ]
 };
 
-const connectedUsers = new Map(); 
+const connectedUsers = new Map();
+
+const broadcastOnlineCount = () => {
+  const total = connectedUsers.size;
+  const vibes = {};
+  connectedUsers.forEach(u => {
+    if (u.vibe) vibes[u.vibe] = (vibes[u.vibe] || 0) + 1;
+  });
+  io.emit('online_count', { total, vibes });
+};
 
 const getRandomIcebreaker = (vibe) => {
   const list = icebreakers[vibe] || icebreakers['flirt'];
   return list[Math.floor(Math.random() * list.length)];
+};
+
+const getRandomDare = () => DARE_CARDS[Math.floor(Math.random() * DARE_CARDS.length)];
+
+const tryMatch = (queue, socket, userData) => {
+  // Try tag-based match first
+  const tagIdx = queue.findIndex(id => {
+    const u = connectedUsers.get(id);
+    return u && userData.tags && u.tags && userData.tags.some(t => u.tags.includes(t));
+  });
+  const idx = tagIdx >= 0 ? tagIdx : 0;
+  return queue.splice(idx, 1)[0];
 };
 
 io.on('connection', async (socket) => {
@@ -180,49 +212,67 @@ io.on('connection', async (socket) => {
     console.error('Ban check error:', err.message);
   }
 
-  connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp });
+  connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp, gender: null, tags: [], country: null, dareTimer: null });
+  broadcastOnlineCount();
 
-  socket.on('join_queue', ({ vibe, isSuperSpark }) => {
+  socket.on('join_queue', ({ vibe, gender, tags, country, userId }) => {
     const user = connectedUsers.get(socket.id);
-    if (!user || user.currentPartner) return; 
+    if (!user || user.currentPartner) return;
 
     user.vibe = vibe;
-    user.spark = false; 
-    
+    user.gender = gender;
+    user.tags = tags || [];
+    user.country = country || null;
+    user.spark = false;
+
     const queue = queues[vibe];
-    if (!queue) return; 
+    if (!queue) return;
 
     if (queue.length > 0) {
-      const partnerSocketId = queue.shift();
-      
+      // For global mode: prefer different country
+      let partnerSocketId;
+      if (vibe === 'global') {
+        const diffIdx = queue.findIndex(id => {
+          const u = connectedUsers.get(id);
+          return u && u.country !== country;
+        });
+        partnerSocketId = diffIdx >= 0 ? queue.splice(diffIdx, 1)[0] : queue.shift();
+      } else {
+        partnerSocketId = tryMatch(queue, socket, user);
+      }
+
       if (io.sockets.sockets.get(partnerSocketId)) {
         const partner = connectedUsers.get(partnerSocketId);
         user.currentPartner = partnerSocketId;
         partner.currentPartner = socket.id;
 
-        socket.emit('matched', { partnerId: partnerSocketId });
-        io.to(partnerSocketId).emit('matched', { partnerId: socket.id });
+        socket.emit('matched', { partnerId: partnerSocketId, partnerGender: partner.gender, partnerTags: partner.tags, partnerCountry: partner.country ? { code: partner.country } : null });
+        io.to(partnerSocketId).emit('matched', { partnerId: socket.id, partnerGender: user.gender, partnerTags: user.tags, partnerCountry: user.country ? { code: user.country } : null });
 
+        // Send icebreaker after 3s
         setTimeout(() => {
           const icebreaker = getRandomIcebreaker(vibe);
           socket.emit('icebreaker', icebreaker);
           io.to(partnerSocketId).emit('icebreaker', icebreaker);
         }, 3000);
 
+        // Send dare card every 90s
+        const sendDare = () => {
+          if (user.currentPartner === partnerSocketId) {
+            const dare = getRandomDare();
+            socket.emit('dare_card', dare);
+            io.to(partnerSocketId).emit('dare_card', dare);
+            user.dareTimer = setTimeout(sendDare, 90000);
+          }
+        };
+        user.dareTimer = setTimeout(sendDare, 90000);
       } else {
-        // partner disconnected, put them back
         queue.push(socket.id);
       }
     } else {
-      if (!queue.includes(socket.id)) {
-        if (isSuperSpark) {
-          // Priority! Push to front of the line
-          queue.unshift(socket.id);
-        } else {
-          queue.push(socket.id);
-        }
-      }
+      if (!queue.includes(socket.id)) queue.push(socket.id);
     }
+    broadcastOnlineCount();
   });
 
   socket.on('spark', () => {
@@ -235,6 +285,13 @@ io.on('connection', async (socket) => {
         socket.emit('mutual_spark');
         io.to(user.currentPartner).emit('mutual_spark');
       }
+    }
+  });
+
+  socket.on('send_gift', ({ gift }) => {
+    const user = connectedUsers.get(socket.id);
+    if (user && user.currentPartner) {
+      io.to(user.currentPartner).emit('gift_received', { gift });
     }
   });
 
@@ -272,41 +329,37 @@ io.on('connection', async (socket) => {
   socket.on('deduct_balance', (data, callback) => {
     const { userId, amount, feature } = data;
     
-    db.get(`SELECT balance FROM wallets WHERE user_id = ?`, [userId], (err, row) => {
-      if (err) return callback({ success: false, message: "Database error" });
-      
+    db.query(`SELECT balance FROM wallets WHERE user_id = $1`, [userId]).then(res => {
+      const row = res.rows[0];
       const currentBalance = row ? row.balance : 0;
       if (currentBalance >= amount) {
-        db.run(`UPDATE wallets SET balance = balance - ? WHERE user_id = ?`, [amount, userId], function(err) {
-          if (err) return callback({ success: false, message: "Transaction failed" });
+        db.query(`UPDATE wallets SET balance = balance - $1 WHERE user_id = $2`, [amount, userId]).then(() => {
           callback({ success: true, newBalance: currentBalance - amount });
-        });
+        }).catch(() => callback({ success: false, message: "Transaction failed" }));
       } else {
         callback({ success: false, message: "Insufficient Prime Balance" });
       }
-    });
+    }).catch(() => callback({ success: false, message: "Database error" }));
   });
 
   const handleDisconnect = () => {
     const user = connectedUsers.get(socket.id);
     if (!user) return;
 
+    if (user.dareTimer) clearTimeout(user.dareTimer);
+
     if (user.vibe && queues[user.vibe]) {
       queues[user.vibe] = queues[user.vibe].filter(id => id !== socket.id);
     }
 
     if (user.currentPartner) {
-      const partnerId = user.currentPartner;
-      io.to(partnerId).emit('partner_disconnected');
-      
-      const partnerUser = connectedUsers.get(partnerId);
-      if (partnerUser) {
-        partnerUser.currentPartner = null;
-        partnerUser.spark = false;
-      }
+      io.to(user.currentPartner).emit('partner_disconnected');
+      const partnerUser = connectedUsers.get(user.currentPartner);
+      if (partnerUser) { partnerUser.currentPartner = null; partnerUser.spark = false; }
     }
-    
+
     connectedUsers.delete(socket.id);
+    broadcastOnlineCount();
   };
 
   socket.on('next', () => {
