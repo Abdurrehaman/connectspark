@@ -264,7 +264,7 @@ function App() {
         try {
           const r = await fetch(`${SOCKET_SERVER_URL}/api/sparks/${u.uid}`);
           const d = await r.json();
-          setSparks(d.sparks || 0);
+          setSparks(1000); // Temporary: free 1000 sparks for testing
         } catch {}
         // Fetch TURN credentials
         try {
@@ -313,17 +313,9 @@ function App() {
   // Sparks helpers
   const spendSparks = useCallback(async (amount, reason) => {
     if (!user) return false;
-    if (sparks < amount) { setShowSparkModal(true); return false; }
-    try {
-      const r = await fetch(`${SOCKET_SERVER_URL}/api/sparks/deduct`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: user.uid, sparks: amount, reason }),
-      });
-      const d = await r.json();
-      if (d.success) { setSparks(d.new_balance); return true; }
-    } catch {}
-    return false;
-  }, [user, sparks]);
+    setSparks(p => Math.max(0, p - amount));
+    return true; // Temporary: always succeed for testing
+  }, [user]);
 
   // WebRTC
   const getMedia = async () => {
@@ -677,7 +669,7 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           {myCountry && <span className="country-badge">{myCountry.flag} {myCountry.name}</span>}
           {/* Sparks balance */}
-          <motion.button className="sparks-pill" onClick={() => setShowSparkModal(true)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+          <motion.button className="sparks-pill" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
             <motion.span animate={{ rotate: [0, 15, -15, 0] }} transition={{ duration: 2, repeat: Infinity }}>⚡</motion.span>
             <span>{sparks} Sparks</span>
           </motion.button>
@@ -789,10 +781,7 @@ function App() {
         </div>
       )}
 
-      {/* Spark Modal */}
-      <AnimatePresence>
-        {showSparkModal && <SparkModal user={user} onClose={() => setShowSparkModal(false)} onSuccess={(bal) => setSparks(bal)} />}
-      </AnimatePresence>
+
     </div>
   );
 
@@ -805,7 +794,7 @@ function App() {
           <div className="logo-small">ConnectSpark ⚡</div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             {onlineCount > 0 && <span className="online-pill"><span className="online-dot-sm" />{onlineCount.toLocaleString()}</span>}
-            <motion.button className="sparks-pill-sm" onClick={() => setShowSparkModal(true)} whileHover={{ scale: 1.05 }}>
+            <motion.button className="sparks-pill-sm" whileHover={{ scale: 1.05 }}>
               ⚡ {sparks}
             </motion.button>
             <button className="report-btn" onClick={() => { if (window.confirm('Report this user?')) { socket.emit('report', { reason: 'reported' }); handleNext(); } }}>
