@@ -11,126 +11,251 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize PostgreSQL (Supabase)
+// ── DATABASE ──────────────────────────────────────────────────────────────────
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
-
 db.connect()
-  .then(() => console.log('Connected to Supabase PostgreSQL ✅'))
-  .catch(err => console.error('Database connection error:', err.message));
+  .then(() => console.log('✅ Connected to PostgreSQL'))
+  .catch(err => console.error('❌ Database error:', err.message));
 
-// Initialize Razorpay
-// Note: In production, these should be real keys in a .env file.
+// ── RAZORPAY ──────────────────────────────────────────────────────────────────
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_mock_key',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'rzp_test_mock_secret',
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Payment Endpoints
+// ── SPARK PACKAGES ────────────────────────────────────────────────────────────
+// Amount in INR, sparks credited on successful payment
+const SPARK_PACKAGES = {
+  starter: { amount: 49,  sparks: 50,  label: 'Starter' },
+  popular: { amount: 99,  sparks: 130, label: 'Popular'  },
+  pro:     { amount: 199, sparks: 300, label: 'Pro'       },
+};
+
+// ── TURN SERVER ────────────────────────────────────────────────────────────────
+// Returns ICE servers for WebRTC — add TURN_* env vars for global relay support
+app.get('/api/turn-credentials', async (req, res) => {
+  let iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+  // Fetch from Metered.ca dynamically
+  try {
+    if (process.env.METERED_API_KEY && process.env.METERED_DOMAIN) {
+      // NOTE: Using native Node fetch or axios here since axios is in package.json
+      const axios = require('axios');
+      const response = await axios.get(`https://${process.env.METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`);
+      if (Array.isArray(response.data)) {
+        iceServers = response.data; // Metered returns the full array including STUN/TURN
+      }
+    }
+  } catch (err) {
+    console.error('Error fetching TURN credentials from Metered:', err.message);
+  }
+  res.json({ iceServers });
+});
+
+// ── STEP 1: CREATE ORDER ───────────────────────────────────────────────────────
+// Frontend sends: { package: 'starter' | 'popular' | 'pro' }
+// Backend creates Razorpay order and returns order_id + package details
 app.post('/api/create-order', async (req, res) => {
-  const { amount } = req.body; // Amount in INR
-  
-  if (!amount || amount * 100 < 100) {
-    return res.status(400).json({ error: "Minimum amount is ₹1 (100 paise)" });
+  const { package: pkg } = req.body;
+  const packageData = SPARK_PACKAGES[pkg];
+
+  if (!packageData) {
+    return res.status(400).json({ error: 'Invalid package. Choose starter, popular, or pro.' });
   }
 
   try {
-    const options = {
-      amount: Math.round(amount * 100), // Convert to paise
-      currency: "INR",
-      receipt: "receipt_" + Date.now(),
-    };
-    const order = await razorpay.orders.create(options);
-    res.json({ order_id: order.id, amount: order.amount, currency: order.currency });
+    const order = await razorpay.orders.create({
+      amount: packageData.amount * 100, // Convert INR to paise
+      currency: 'INR',
+      receipt: `spark_${pkg}_${Date.now()}`,
+      notes: { package: pkg, sparks: packageData.sparks },
+    });
+
+    res.json({
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      package: pkg,
+      sparks: packageData.sparks,
+      label: packageData.label,
+    });
   } catch (err) {
-    console.error("Payment Order Error:", err);
-    res.status(500).json({ error: err.message });
+    console.error('❌ Create order error:', err);
+    res.status(500).json({ error: err.error?.description || err.message || 'Failed to create order' });
   }
 });
 
-app.post('/api/verify-payment', (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+// ── STEP 2: VERIFY PAYMENT + CREDIT SPARKS ────────────────────────────────────
+// Frontend sends: { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, package }
+// Backend: verifies HMAC → credits Sparks → returns new balance
+app.post('/api/verify-payment', async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, package: pkg } = req.body;
 
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-    return res.status(400).json({ success: false, message: "Missing required payment fields" });
+  // Validate fields
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !userId || !pkg) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
   }
-  
-  const sign = razorpay_order_id + "|" + razorpay_payment_id;
+
+  // Validate package
+  const packageData = SPARK_PACKAGES[pkg];
+  if (!packageData) {
+    return res.status(400).json({ success: false, message: 'Invalid package' });
+  }
+
+  // ✅ HMAC-SHA256 Signature Verification
+  // This is the ONLY way to confirm the payment is real and not faked
+  const sign = razorpay_order_id + '|' + razorpay_payment_id;
   const expectedSign = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
     .update(sign)
-    .digest("hex");
+    .digest('hex');
 
-  if (razorpay_signature === expectedSign) {
-    return res.json({ success: true, message: "Payment verified successfully" });
-  } else {
-    return res.status(400).json({ success: false, message: "Signature mismatch — payment not verified" });
+  if (razorpay_signature !== expectedSign) {
+    console.warn(`⚠️  Signature mismatch for user ${userId} — possible fraud attempt`);
+    return res.status(400).json({ success: false, message: 'Payment signature mismatch — not verified' });
+  }
+
+  // ✅ Signature valid — credit Sparks atomically
+  try {
+    const result = await db.query(
+      `INSERT INTO wallets (user_id, balance)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id)
+       DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()
+       RETURNING balance`,
+      [userId, packageData.sparks]
+    );
+
+    const newBalance = result.rows[0].balance;
+    console.log(`✅ Credited ${packageData.sparks} Sparks to ${userId} — new balance: ${newBalance}`);
+
+    res.json({
+      success: true,
+      message: `${packageData.sparks} Sparks added successfully!`,
+      sparks_added: packageData.sparks,
+      new_balance: newBalance,
+    });
+  } catch (err) {
+    console.error('❌ Credit Sparks error:', err);
+    res.status(500).json({ success: false, message: 'Payment verified but failed to credit Sparks. Contact support.' });
   }
 });
 
-app.get('/api/wallet/balance/:userId', async (req, res) => {
+// ── GET SPARK BALANCE ──────────────────────────────────────────────────────────
+app.get('/api/sparks/:userId', async (req, res) => {
   const { userId } = req.params;
-  if (!userId) return res.status(400).json({ error: "No user ID" });
-  
+  if (!userId) return res.status(400).json({ error: 'No user ID' });
+
   try {
     const result = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
     if (result.rows.length === 0) {
-      await db.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING', [userId]);
-      return res.json({ balance: 0 });
+      await db.query(
+        'INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING',
+        [userId]
+      );
+      return res.json({ sparks: 0 });
     }
-    res.json({ balance: result.rows[0].balance });
+    res.json({ sparks: result.rows[0].balance });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/wallet/verify-funds', async (req, res) => {
-  const { userId, amount, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-
-  const sign = razorpay_order_id + "|" + razorpay_payment_id;
-  const expectedSign = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(sign).digest("hex");
-
-  if (razorpay_signature !== expectedSign) {
-    return res.status(400).json({ success: false, message: "Invalid signature" });
+// ── DEDUCT SPARKS ─────────────────────────────────────────────────────────────
+// Frontend sends: { userId, sparks, reason }
+app.post('/api/sparks/deduct', async (req, res) => {
+  const { userId, sparks, reason } = req.body;
+  if (!userId || !sparks || sparks < 1) {
+    return res.status(400).json({ success: false, message: 'Invalid deduct request' });
   }
 
   try {
-    await db.query(
-      `INSERT INTO wallets (user_id, balance) VALUES ($1, $2)
-       ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()`,
-      [userId, amount]
-    );
-    res.json({ success: true, added: amount });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+    const current = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
+    const balance = current.rows.length > 0 ? current.rows[0].balance : 0;
 
-app.post('/api/wallet/deduct', async (req, res) => {
-  const { userId, amount } = req.body;
-  
-  try {
-    const result = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
-    const currentBalance = result.rows.length > 0 ? result.rows[0].balance : 0;
-    
-    if (currentBalance < amount) {
-      return res.status(400).json({ success: false, message: "Insufficient Prime Balance" });
+    if (balance < sparks) {
+      return res.status(400).json({ success: false, message: 'Not enough Sparks', balance });
     }
-    await db.query(
-      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2',
-      [amount, userId]
+
+    const updated = await db.query(
+      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2 RETURNING balance',
+      [sparks, userId]
     );
-    res.json({ success: true, newBalance: currentBalance - amount });
+
+    console.log(`⚡ Deducted ${sparks} Sparks from ${userId} for ${reason || 'unknown'}`);
+    res.json({ success: true, new_balance: updated.rows[0].balance });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+// ── PROFILES ──────────────────────────────────────────────────────────────────
+app.post('/api/profiles', async (req, res) => {
+  const { userId, screenName } = req.body;
+  if (!userId || !screenName) return res.status(400).json({ success: false, message: 'Invalid profile data' });
+  try {
+    await db.query(
+      'INSERT INTO profiles (user_id, screen_name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET screen_name = $2',
+      [userId, screenName]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get('/api/profiles/:userId', async (req, res) => {
+  try {
+    const result = await db.query('SELECT screen_name FROM profiles WHERE user_id = $1', [req.params.userId]);
+    res.json({ screenName: result.rows.length > 0 ? result.rows[0].screen_name : null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── FRIENDS & INBOX ───────────────────────────────────────────────────────────
+app.get('/api/friends/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await db.query(`
+      SELECT 
+        CASE WHEN f.user_id_1 = $1 THEN f.user_id_2 ELSE f.user_id_1 END as friend_id,
+        p.screen_name
+      FROM friends f
+      JOIN profiles p ON p.user_id = (CASE WHEN f.user_id_1 = $1 THEN f.user_id_2 ELSE f.user_id_1 END)
+      WHERE f.user_id_1 = $1 OR f.user_id_2 = $1
+    `, [userId]);
+    res.json({ friends: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/messages/:userId/:friendId', async (req, res) => {
+  try {
+    const { userId, friendId } = req.params;
+    const result = await db.query(`
+      SELECT sender_id, receiver_id, message, created_at 
+      FROM direct_messages 
+      WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1)
+      ORDER BY created_at ASC
+    `, [userId, friendId]);
+    res.json({ messages: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
+
 
 const queues = {
   'soul_search': [],
@@ -150,25 +275,6 @@ const DARE_CARDS = [
   { text: "Speak in an accent for the next 2 minutes!" },
 ];
 
-const icebreakers = {
-  'soul_search': [
-    { text: "What's a life lesson you learned the hard way?", answers: ["That you can't pour from an empty cup—self-care isn't selfish.", "Not everyone who smiles at you is your friend.", "Sometimes, peace is better than being right."] },
-    { text: "If you could have dinner with any historical figure, who would it be?", answers: ["Leonardo da Vinci, just to see how his brain worked.", "Cleopatra, to learn the art of charm and strategy.", "Albert Einstein, to discuss the mysteries of the universe."] }
-  ],
-  'flirt': [
-    { text: "What's the most spontaneous thing you've ever done?", answers: ["Booked a flight to a random city at 2 AM.", "Got a tattoo on a dare.", "Walked up to a stranger and asked them out on the spot."] },
-    { text: "What's your biggest dealbreaker on a first date?", answers: ["Being rude to the waiter. Instant turn-off.", "Spending the entire time on their phone.", "Only talking about their ex."] }
-  ],
-  'after_hours': [
-    { text: "What's a secret fantasy you've never told anyone?", answers: ["Getting caught doing something risky in public.", "A weekend getaway with zero inhibitions and no rules.", "Roleplaying a complete stranger in a fancy hotel bar."] },
-    { text: "What's your biggest guilty pleasure?", answers: ["Binge-watching trashy reality TV all night.", "Eating a whole tub of ice cream in bed.", "Listening to 2000s boy bands unironically."] }
-  ],
-  'global': [
-    { text: "What's one thing your country does better than anywhere else?", answers: ["The food — nothing beats home cooking!", "The hospitality — strangers become friends fast.", "The festivals — nothing compares to our celebrations!"] },
-    { text: "What is one thing you wish people knew about your culture?", answers: ["We're much more open-minded than stereotypes suggest.", "Family is everything — it shapes who we are.", "Our music and art are world class, just underrated globally."] }
-  ]
-};
-
 const connectedUsers = new Map();
 
 const broadcastOnlineCount = () => {
@@ -178,11 +284,6 @@ const broadcastOnlineCount = () => {
     if (u.vibe) vibes[u.vibe] = (vibes[u.vibe] || 0) + 1;
   });
   io.emit('online_count', { total, vibes });
-};
-
-const getRandomIcebreaker = (vibe) => {
-  const list = icebreakers[vibe] || icebreakers['flirt'];
-  return list[Math.floor(Math.random() * list.length)];
 };
 
 const getRandomDare = () => DARE_CARDS[Math.floor(Math.random() * DARE_CARDS.length)];
@@ -212,7 +313,7 @@ io.on('connection', async (socket) => {
     console.error('Ban check error:', err.message);
   }
 
-  connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp, gender: null, tags: [], country: null, dareTimer: null });
+  connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp, gender: null, tags: [], country: null, dareTimer: null, userId: null });
   broadcastOnlineCount();
 
   socket.on('join_queue', ({ vibe, gender, tags, country, userId }) => {
@@ -224,6 +325,7 @@ io.on('connection', async (socket) => {
     user.tags = tags || [];
     user.country = country || null;
     user.spark = false;
+    user.userId = userId;
 
     const queue = queues[vibe];
     if (!queue) return;
@@ -249,12 +351,6 @@ io.on('connection', async (socket) => {
         socket.emit('matched', { partnerId: partnerSocketId, partnerGender: partner.gender, partnerTags: partner.tags, partnerCountry: partner.country ? { code: partner.country } : null });
         io.to(partnerSocketId).emit('matched', { partnerId: socket.id, partnerGender: user.gender, partnerTags: user.tags, partnerCountry: user.country ? { code: user.country } : null });
 
-        // Send icebreaker after 3s
-        setTimeout(() => {
-          const icebreaker = getRandomIcebreaker(vibe);
-          socket.emit('icebreaker', icebreaker);
-          io.to(partnerSocketId).emit('icebreaker', icebreaker);
-        }, 3000);
 
         // Send dare card every 90s
         const sendDare = () => {
@@ -275,7 +371,7 @@ io.on('connection', async (socket) => {
     broadcastOnlineCount();
   });
 
-  socket.on('spark', () => {
+  socket.on('spark', async () => {
     const user = connectedUsers.get(socket.id);
     if (user && user.currentPartner) {
       user.spark = true;
@@ -284,6 +380,21 @@ io.on('connection', async (socket) => {
       if (partner && partner.spark) {
         socket.emit('mutual_spark');
         io.to(user.currentPartner).emit('mutual_spark');
+
+        // Persist friendship
+        if (user.userId && partner.userId) {
+          try {
+            // Use least/greatest to ensure unique composite primary key ordering
+            const u1 = user.userId < partner.userId ? user.userId : partner.userId;
+            const u2 = user.userId < partner.userId ? partner.userId : user.userId;
+            await db.query(
+              'INSERT INTO friends (user_id_1, user_id_2) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+              [u1, u2]
+            );
+          } catch (err) {
+            console.error('Error saving friendship:', err.message);
+          }
+        }
       }
     }
   });
@@ -302,6 +413,25 @@ io.on('connection', async (socket) => {
         message: data.message,
         senderId: socket.id
       });
+    }
+  });
+
+  // Direct messaging (Inbox)
+  socket.on('send_dm', async ({ senderId, receiverId, message }) => {
+    try {
+      await db.query(
+        'INSERT INTO direct_messages (sender_id, receiver_id, message) VALUES ($1, $2, $3)',
+        [senderId, receiverId, message]
+      );
+      
+      // If receiver is online, emit to them instantly
+      for (let [sockId, u] of connectedUsers.entries()) {
+        if (u.userId === receiverId) {
+          io.to(sockId).emit('receive_dm', { senderId, receiverId, message, created_at: new Date() });
+        }
+      }
+    } catch (err) {
+      console.error('Error sending DM:', err.message);
     }
   });
 
