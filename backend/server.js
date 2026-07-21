@@ -227,7 +227,7 @@ app.get('/api/friends/:userId', async (req, res) => {
         CASE WHEN f.user_id_1 = $1 THEN f.user_id_2 ELSE f.user_id_1 END as friend_id,
         p.screen_name
       FROM friends f
-      JOIN profiles p ON p.user_id = (CASE WHEN f.user_id_1 = $1 THEN f.user_id_2 ELSE f.user_id_1 END)
+      LEFT JOIN profiles p ON p.user_id = (CASE WHEN f.user_id_1 = $1 THEN f.user_id_2 ELSE f.user_id_1 END)
       WHERE f.user_id_1 = $1 OR f.user_id_2 = $1
     `, [userId]);
     res.json({ friends: result.rows });

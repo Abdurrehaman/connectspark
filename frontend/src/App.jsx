@@ -175,6 +175,62 @@ function SparkModal({ user, onClose, onSuccess }) {
   );
 }
 
+// ── FULLSCREEN GIFT ANIMATION ──────────────────────────────────────────────────
+function FullscreenGiftAnimation({ gift }) {
+  if (!gift) return null;
+  const count = 40;
+  const particles = Array.from({ length: count });
+  return (
+    <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 9999, overflow: 'hidden' }}>
+      {particles.map((_, i) => {
+        const xStart = Math.random() * 100;
+        const delay = Math.random() * 0.5;
+        const duration = 1.5 + Math.random();
+        const size = 2 + Math.random() * 3;
+        
+        let animation;
+        if (gift.emoji === '🌹') {
+          // Petals falling down
+          animation = {
+            initial: { top: '-10%', left: `${xStart}%`, rotate: 0, opacity: 1, scale: size },
+            animate: { top: '110%', left: `${xStart + (Math.random() * 20 - 10)}%`, rotate: 360, opacity: 0 },
+          };
+        } else if (gift.emoji === '❤️' || gift.emoji === '💖' || gift.emoji === '💜') {
+          // Hearts floating up
+          animation = {
+            initial: { bottom: '-10%', left: `${xStart}%`, rotate: -20, opacity: 1, scale: size },
+            animate: { bottom: '110%', left: `${xStart + (Math.random() * 20 - 10)}%`, rotate: 20, opacity: 0 },
+          };
+        } else if (gift.emoji === '🔥') {
+          // Fire bursting from bottom center
+          animation = {
+            initial: { bottom: '0%', left: '50%', opacity: 1, scale: size * 1.5 },
+            animate: { bottom: `${50 + Math.random()*50}%`, left: `${10 + Math.random()*80}%`, opacity: 0, scale: size * 0.5 },
+          };
+        } else {
+          // Default: just a small burst in center
+          animation = {
+            initial: { top: '50%', left: '50%', opacity: 1, scale: 0 },
+            animate: { top: `${Math.random()*100}%`, left: `${Math.random()*100}%`, opacity: 0, scale: size },
+          };
+        }
+
+        return (
+          <motion.div
+            key={i}
+            initial={animation.initial}
+            animate={animation.animate}
+            transition={{ duration, delay, ease: 'easeOut' }}
+            style={{ position: 'absolute', fontSize: '2rem' }}
+          >
+            {gift.emoji}
+          </motion.div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── MAIN APP ───────────────────────────────────────────────────────────────────
 function App() {
   // Auth
@@ -826,14 +882,17 @@ function App() {
         {/* Gift Explosion */}
         <AnimatePresence>
           {incomingGift && (
-            <motion.div className="gift-explosion" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-              <motion.div className="gift-emoji" initial={{ scale: 0 }} animate={{ scale: [0, 1.5, 1] }} transition={{ type: 'spring', stiffness: 300 }}>
-                {incomingGift.emoji}
+            <>
+              <FullscreenGiftAnimation gift={incomingGift} />
+              <motion.div className="gift-explosion" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                <motion.div className="gift-emoji" initial={{ scale: 0 }} animate={{ scale: [0, 1.5, 1] }} transition={{ type: 'spring', stiffness: 300 }}>
+                  {incomingGift.emoji}
+                </motion.div>
+                <motion.p initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
+                  Stranger sent you {incomingGift.label}!
+                </motion.p>
               </motion.div>
-              <motion.p initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
-                Stranger sent you {incomingGift.label}!
-              </motion.p>
-            </motion.div>
+            </>
           )}
         </AnimatePresence>
 
