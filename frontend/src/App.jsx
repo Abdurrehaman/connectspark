@@ -271,7 +271,8 @@ function App() {
   const [partnerTags, setPartnerTags] = useState([]);
   const [partnerCountry, setPartnerCountry] = useState(null);
   const [partnerWealthRank, setPartnerWealthRank] = useState('');
-  const [distanceKm, setDistanceKm] = useState(null);
+  const [partnerLocationLabel, setPartnerLocationLabel] = useState(null);
+  const [myLocationLabel, setMyLocationLabel] = useState(null);
   const [myCountry, setMyCountry]   = useState(null);
   const [genderPref, setGenderPref] = useState('anyone');
   const [location, setLocation] = useState(null);
@@ -427,10 +428,12 @@ function App() {
       sock.on('online_count', ({ total, vibes }) => { setOnlineCount(total); setVibeCount(vibes || {}); });
       sock.on('banned', (d) => { alert(d.message); window.location.reload(); });
 
-      sock.on('matched', async ({ partnerId, partnerGender: pG, partnerTags: pT, partnerCountry: pC, partnerWealthRank: pWR, distanceKm: dKm }) => {
+      sock.on('matched', async ({ partnerId, partnerGender: pG, partnerTags: pT, partnerCountry: pC, partnerWealthRank: pWR, locationLabel, myLocationLabel: myLL }) => {
         setIsMatching(false); setIsConnected(true);
         setPartnerGender(pG); setPartnerTags(pT || []); setPartnerCountry(pC);
-        setPartnerWealthRank(pWR); setDistanceKm(dKm);
+        setPartnerWealthRank(pWR || ''); 
+        setPartnerLocationLabel(locationLabel || null);
+        setMyLocationLabel(myLL || null);
         setMessages([{ text: '✨ Connected! Say hello!', type: 'system' }]);
         startMystery(pG);
         if (!peerConnection.current) peerConnection.current = createPeer(sock);
@@ -929,8 +932,8 @@ function App() {
         {/* Videos */}
         <div className="videos-container">
           {[
-            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive, wealth: null, distance: null },
-            { ref: remoteVideoRef, label: `Stranger ${partnerCountry?.flag || ''}`, flipped: remoteFlipped, setFlipped: setRemoteFlipped, muted: false, showControls: false, mystery: mysteryActive, wealth: partnerWealthRank, distance: distanceKm },
+            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive, wealth: null, locLabel: myLocationLabel },
+            { ref: remoteVideoRef, label: `Stranger ${partnerCountry?.flag || ''}`, flipped: remoteFlipped, setFlipped: setRemoteFlipped, muted: false, showControls: false, mystery: mysteryActive, wealth: partnerWealthRank, locLabel: partnerLocationLabel },
           ].map((v, i) => (
             <motion.div key={i} className="video-box" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: i * 0.1 }}>
               <span className="video-label" style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -939,7 +942,7 @@ function App() {
                   {(i === 0 ? gender : partnerGender) && <span className="gender-badge">{(i === 0 ? gender : partnerGender) === 'male' ? '👨' : (i === 0 ? gender : partnerGender) === 'female' ? '👩' : '🧑'}</span>}
                 </div>
                 {v.wealth && <div style={{ fontSize: '0.8rem', color: '#fbbf24', fontWeight: 'bold' }}>{v.wealth}</div>}
-                {v.distance && <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>📍 {v.distance} km away</div>}
+                {v.locLabel && <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>📍 {v.locLabel}</div>}
               </span>
               {v.mystery && (
                 <motion.div className="mystery-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>

@@ -288,16 +288,42 @@ const broadcastOnlineCount = () => {
 
 const getRandomDare = () => DARE_CARDS[Math.floor(Math.random() * DARE_CARDS.length)];
 
-function getDistance(lat1, lon1, lat2, lon2) {
-  if (!lat1 || !lon1 || !lat2 || !lon2) return null;
-  const R = 6371; // km
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon/2) * Math.sin(dLon/2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return Math.round(R * c);
+async function getLocationLabel(loc1, loc2) {
+  // Returns a smart location label:
+  // Different countries → show each user's country name only
+  // Same country → show state/region
+  if (!loc1 || !loc2) return null;
+
+  async function reverseGeocode(lat, lng) {
+    try {
+      const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`, {
+        headers: { 'User-Agent': 'ConnectSpark/1.0' }
+      });
+      const data = await r.json();
+      return {
+        country: data.address?.country || null,
+        countryCode: data.address?.country_code?.toUpperCase() || null,
+        region: data.address?.state || data.address?.county || data.address?.region || null,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  const [g1, g2] = await Promise.all([
+    reverseGeocode(loc1.lat, loc1.lng),
+    reverseGeocode(loc2.lat, loc2.lng)
+  ]);
+
+  if (!g1 || !g2) return null;
+
+  if (g1.countryCode !== g2.countryCode) {
+    // Different countries — return each user's country
+    return { user1: g1.country, user2: g2.country, sameCountry: false };
+  } else {
+    // Same country — return region/state
+    return { user1: g1.region || g1.country, user2: g2.region || g2.country, sameCountry: true };
+  }
 }
 
 function getWealthRank(spent) {
@@ -383,13 +409,21 @@ io.on('connection', async (socket) => {
         user.currentPartner = partnerSocketId;
         partner.currentPartner = socket.id;
 
+        // Smart location labels
+        let locationInfo = null;
+        if (user.location && partner.location) {
+          locationInfo = await getLocationLabel(user.location, partner.location).catch(() => null);
+        }
+
         socket.emit('matched', { 
           partnerId: partnerSocketId, 
           partnerGender: partner.gender, 
           partnerTags: partner.tags, 
           partnerCountry: partner.country ? { code: partner.country } : null,
           partnerWealthRank: getWealthRank(partner.totalSpent),
-          distanceKm: user.location && partner.location ? getDistance(user.location.lat, user.location.lng, partner.location.lat, partner.location.lng) : null
+          locationLabel: locationInfo ? locationInfo.user2 : null,
+          myLocationLabel: locationInfo ? locationInfo.user1 : null,
+          sameCountry: locationInfo ? locationInfo.sameCountry : false,
         });
         io.to(partnerSocketId).emit('matched', { 
           partnerId: socket.id, 
@@ -397,7 +431,9 @@ io.on('connection', async (socket) => {
           partnerTags: user.tags, 
           partnerCountry: user.country ? { code: user.country } : null,
           partnerWealthRank: getWealthRank(user.totalSpent),
-          distanceKm: user.location && partner.location ? getDistance(user.location.lat, user.location.lng, partner.location.lat, partner.location.lng) : null
+          locationLabel: locationInfo ? locationInfo.user1 : null,
+          myLocationLabel: locationInfo ? locationInfo.user2 : null,
+          sameCountry: locationInfo ? locationInfo.sameCountry : false,
         });
 
 
