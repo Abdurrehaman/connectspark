@@ -245,6 +245,7 @@ function App() {
 
   // Sparks
   const [sparks, setSparks]         = useState(0);
+  const [myTotalSpent, setMyTotalSpent] = useState(0);
   const [showSparkModal, setShowSparkModal] = useState(false);
 
   // Onboarding & App View
@@ -326,6 +327,7 @@ function App() {
           const r = await fetch(`${SOCKET_SERVER_URL}/api/sparks/${u.uid}`);
           const d = await r.json();
           setSparks(d.sparks ?? 0);
+          setMyTotalSpent(d.total_spent ?? 0);
         } catch {}
         // Fetch TURN credentials
         try {
@@ -385,8 +387,25 @@ function App() {
   // Sparks helpers
   const spendSparks = useCallback(async (amount, reason) => {
     if (!user) return false;
-    setSparks(p => Math.max(0, p - amount));
-    return true; // Temporary: always succeed for testing
+    try {
+      const r = await fetch(`${SOCKET_SERVER_URL}/api/sparks/deduct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.uid, sparks: amount, reason })
+      });
+      const d = await r.json();
+      if (d.success) {
+        setSparks(d.new_balance);
+        setMyTotalSpent(p => p + amount);
+        return true;
+      } else {
+        alert(d.message || 'Not enough sparks!');
+        return false;
+      }
+    } catch {
+      alert('Error connecting to server.');
+      return false;
+    }
   }, [user]);
 
   // WebRTC
@@ -619,6 +638,13 @@ function App() {
       </div>
     </div>
   );
+
+  const getWealthRank = (spent) => {
+    if (!spent || spent < 100) return 'Sparkler 🤍';
+    if (spent < 500) return 'Hustler ⭐';
+    if (spent < 2000) return 'High Roller 🌟🌟';
+    return 'Elite 👑🌟🌟🌟';
+  };
 
   // ── AUTH ─────────────────────────────────────────────────────────────────────
   if (!user) return (
@@ -882,6 +908,11 @@ function App() {
       )}
 
 
+      {/* Spark Modal in landing */}
+      <AnimatePresence>
+        {showSparkModal && <SparkModal user={user} onClose={() => setShowSparkModal(false)} onSuccess={(bal) => setSparks(bal)} />}
+      </AnimatePresence>
+
     </div>
   );
 
@@ -943,7 +974,7 @@ function App() {
         {/* Videos */}
         <div className="videos-container">
           {[
-            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive, wealth: null, locLabel: myLocationLabel },
+            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive, wealth: getWealthRank(myTotalSpent), locLabel: myLocationLabel },
             { ref: remoteVideoRef, label: `Stranger ${partnerCountry?.flag || ''}`, flipped: remoteFlipped, setFlipped: setRemoteFlipped, muted: false, showControls: false, mystery: mysteryActive, wealth: partnerWealthRank, locLabel: partnerLocationLabel },
           ].map((v, i) => (
             <motion.div key={i} className="video-box" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: i * 0.1 }}>
