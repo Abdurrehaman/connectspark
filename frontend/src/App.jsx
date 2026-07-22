@@ -11,9 +11,9 @@ const RZP_KEY = import.meta.env.VITE_RAZORPAY_KEY_ID;
 
 // ── SPARK PACKAGES ─────────────────────────────────────────────────────────────
 const SPARK_PACKAGES = [
-  { id: 'starter', price: 49,  sparks: 50,  label: 'Starter',    badge: null,      color: '#38bdf8' },
-  { id: 'popular', price: 99,  sparks: 130, label: 'Popular',    badge: '⭐ Best',  color: '#f43f5e' },
-  { id: 'pro',     price: 199, sparks: 300, label: 'Pro',        badge: '🔥 Max',   color: '#a855f7' },
+  { id: 'starter', price: 1.49,  sparks: 100,  label: 'Starter',    badge: null,      color: '#38bdf8' },
+  { id: 'popular', price: 4.99,  sparks: 500,  label: 'Popular',    badge: '⭐ Best',  color: '#f43f5e' },
+  { id: 'pro',     price: 14.99, sparks: 2000, label: 'Whale',      badge: '🔥 Max',   color: '#a855f7' },
 ];
 
 const SPARK_COSTS = { super_spark: 20, premium_gift: 10 };
@@ -147,7 +147,7 @@ function SparkModal({ user, onClose, onSuccess }) {
               {pkg.badge && <div className="pkg-badge">{pkg.badge}</div>}
               <div className="pkg-sparks">⚡ {pkg.sparks}</div>
               <div className="pkg-label">{pkg.label}</div>
-              <div className="pkg-price">₹{pkg.price}</div>
+              <div className="pkg-price">${pkg.price}</div>
               <motion.button
                 className="pkg-buy-btn"
                 onClick={() => handleBuy(pkg)}
@@ -155,7 +155,7 @@ function SparkModal({ user, onClose, onSuccess }) {
                 whileHover={{ scale: 1.05 }}
                 whileTap={{ scale: 0.95 }}
               >
-                {loading === pkg.id ? '...' : `Buy ₹${pkg.price}`}
+                {loading === pkg.id ? '...' : `Buy $${pkg.price}`}
               </motion.button>
             </motion.div>
           ))}
@@ -270,7 +270,11 @@ function App() {
   const [partnerGender, setPartnerGender] = useState(null);
   const [partnerTags, setPartnerTags] = useState([]);
   const [partnerCountry, setPartnerCountry] = useState(null);
+  const [partnerWealthRank, setPartnerWealthRank] = useState('');
+  const [distanceKm, setDistanceKm] = useState(null);
   const [myCountry, setMyCountry]   = useState(null);
+  const [genderPref, setGenderPref] = useState('anyone');
+  const [location, setLocation] = useState(null);
 
   // Video
   const [hasVideo, setHasVideo]     = useState(true);
@@ -423,9 +427,10 @@ function App() {
       sock.on('online_count', ({ total, vibes }) => { setOnlineCount(total); setVibeCount(vibes || {}); });
       sock.on('banned', (d) => { alert(d.message); window.location.reload(); });
 
-      sock.on('matched', async ({ partnerId, partnerGender: pG, partnerTags: pT, partnerCountry: pC }) => {
+      sock.on('matched', async ({ partnerId, partnerGender: pG, partnerTags: pT, partnerCountry: pC, partnerWealthRank: pWR, distanceKm: dKm }) => {
         setIsMatching(false); setIsConnected(true);
         setPartnerGender(pG); setPartnerTags(pT || []); setPartnerCountry(pC);
+        setPartnerWealthRank(pWR); setDistanceKm(dKm);
         setMessages([{ text: '✨ Connected! Say hello!', type: 'system' }]);
         startMystery(pG);
         if (!peerConnection.current) peerConnection.current = createPeer(sock);
@@ -472,11 +477,27 @@ function App() {
   }, [user, onboardingDone, socket, gender]);
 
   const startMatching = async (vibe) => {
+    if (genderPref !== 'anyone') {
+      const ok = await spendSparks(5, 'gender_filter');
+      if (!ok) return;
+    }
+
     setSelectedVibe(vibe); setIsMatching(true); setMessages([]); cleanup();
     if (!localStream.current) await getMedia();
     
+    let currentLoc = location;
+    if (!currentLoc && navigator.geolocation) {
+      try {
+        const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10000 }));
+        currentLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setLocation(currentLoc);
+      } catch (e) {
+        console.warn('Location denied');
+      }
+    }
+    
     if (socket) {
-      socket.emit('join_queue', { vibe, gender, tags: selectedTags, country: myCountry?.code, userId: user?.uid });
+      socket.emit('join_queue', { vibe, gender, tags: selectedTags, country: myCountry?.code, userId: user?.uid, genderPref, location: currentLoc });
     }
   };
 
@@ -725,7 +746,7 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           {myCountry && <span className="country-badge">{myCountry.flag} {myCountry.name}</span>}
           {/* Sparks balance */}
-          <motion.button className="sparks-pill" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+          <motion.button className="sparks-pill" onClick={() => setShowSparkModal(true)} whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
             <motion.span animate={{ rotate: [0, 15, -15, 0] }} transition={{ duration: 2, repeat: Infinity }}>⚡</motion.span>
             <span>{sparks} Sparks</span>
           </motion.button>
@@ -766,6 +787,15 @@ function App() {
             {selectedTags.length > 0 && (
               <p className="tags-preview">{selectedTags.map(t => INTEREST_TAGS.find(x => x.id === t)?.label).join(' · ')}</p>
             )}
+            
+            <div className="gender-filter" style={{ marginTop: '20px', background: 'rgba(0,0,0,0.5)', padding: '10px 20px', borderRadius: '20px', display: 'inline-block' }}>
+              <label style={{ marginRight: '10px', fontWeight: 'bold' }}>Match With:</label>
+              <select value={genderPref} onChange={(e) => setGenderPref(e.target.value)} style={{ background: 'transparent', color: 'white', border: '1px solid rgba(255,255,255,0.2)', padding: '5px 10px', borderRadius: '10px', outline: 'none', cursor: 'pointer' }}>
+                <option value="anyone" style={{ color: 'black' }}>Anyone (Free)</option>
+                <option value="male" style={{ color: 'black' }}>Men (⚡ 5 Sparks)</option>
+                <option value="female" style={{ color: 'black' }}>Women (⚡ 5 Sparks)</option>
+              </select>
+            </div>
           </motion.div>
 
           {/* Vibe Cards */}
@@ -899,13 +929,17 @@ function App() {
         {/* Videos */}
         <div className="videos-container">
           {[
-            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive },
-            { ref: remoteVideoRef, label: `Stranger ${partnerCountry?.flag || ''}`, flipped: remoteFlipped, setFlipped: setRemoteFlipped, muted: false, showControls: false, mystery: mysteryActive },
+            { ref: localVideoRef, label: `You ${myCountry?.flag || ''}`, flipped: localFlipped, setFlipped: setLocalFlipped, muted: true, showControls: true, mystery: mysteryActive, wealth: null, distance: null },
+            { ref: remoteVideoRef, label: `Stranger ${partnerCountry?.flag || ''}`, flipped: remoteFlipped, setFlipped: setRemoteFlipped, muted: false, showControls: false, mystery: mysteryActive, wealth: partnerWealthRank, distance: distanceKm },
           ].map((v, i) => (
             <motion.div key={i} className="video-box" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: i * 0.1 }}>
-              <span className="video-label">
-                {v.label}
-                {(i === 0 ? gender : partnerGender) && <span className="gender-badge">{(i === 0 ? gender : partnerGender) === 'male' ? '👨' : (i === 0 ? gender : partnerGender) === 'female' ? '👩' : '🧑'}</span>}
+              <span className="video-label" style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div>
+                  {v.label}
+                  {(i === 0 ? gender : partnerGender) && <span className="gender-badge">{(i === 0 ? gender : partnerGender) === 'male' ? '👨' : (i === 0 ? gender : partnerGender) === 'female' ? '👩' : '🧑'}</span>}
+                </div>
+                {v.wealth && <div style={{ fontSize: '0.8rem', color: '#fbbf24', fontWeight: 'bold' }}>{v.wealth}</div>}
+                {v.distance && <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>📍 {v.distance} km away</div>}
               </span>
               {v.mystery && (
                 <motion.div className="mystery-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>

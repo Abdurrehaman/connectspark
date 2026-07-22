@@ -152,15 +152,15 @@ app.get('/api/sparks/:userId', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'No user ID' });
 
   try {
-    const result = await db.query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
+    const result = await db.query('SELECT balance, total_spent FROM wallets WHERE user_id = $1', [userId]);
     if (result.rows.length === 0) {
       await db.query(
-        'INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING',
+        'INSERT INTO wallets (user_id, balance, total_spent) VALUES ($1, 0, 0) ON CONFLICT (user_id) DO NOTHING',
         [userId]
       );
-      return res.json({ sparks: 0 });
+      return res.json({ sparks: 0, total_spent: 0 });
     }
-    res.json({ sparks: result.rows[0].balance });
+    res.json({ sparks: result.rows[0].balance, total_spent: result.rows[0].total_spent || 0 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -183,12 +183,12 @@ app.post('/api/sparks/deduct', async (req, res) => {
     }
 
     const updated = await db.query(
-      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE user_id = $2 RETURNING balance',
+      'UPDATE wallets SET balance = balance - $1, total_spent = COALESCE(total_spent, 0) + $1, updated_at = NOW() WHERE user_id = $2 RETURNING balance, total_spent',
       [sparks, userId]
     );
 
     console.log(`⚡ Deducted ${sparks} Sparks from ${userId} for ${reason || 'unknown'}`);
-    res.json({ success: true, new_balance: updated.rows[0].balance });
+    res.json({ success: true, new_balance: updated.rows[0].balance, total_spent: updated.rows[0].total_spent });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -288,14 +288,37 @@ const broadcastOnlineCount = () => {
 
 const getRandomDare = () => DARE_CARDS[Math.floor(Math.random() * DARE_CARDS.length)];
 
+function getDistance(lat1, lon1, lat2, lon2) {
+  if (!lat1 || !lon1 || !lat2 || !lon2) return null;
+  const R = 6371; // km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return Math.round(R * c);
+}
+
+function getWealthRank(spent) {
+  if (!spent || spent < 100) return 'Sparkler 🤍';
+  if (spent < 500) return 'Hustler ⭐';
+  if (spent < 2000) return 'High Roller 🌟🌟';
+  return 'Elite 👑🌟🌟🌟';
+}
+
 const tryMatch = (queue, socket, userData) => {
-  // Try tag-based match first
-  const tagIdx = queue.findIndex(id => {
+  // First, find anyone that fits gender constraints
+  const possibleMatchIdx = queue.findIndex(id => {
     const u = connectedUsers.get(id);
-    return u && userData.tags && u.tags && userData.tags.some(t => u.tags.includes(t));
+    if (!u) return false;
+    if (userData.genderPref !== 'anyone' && u.gender !== userData.genderPref) return false;
+    if (u.genderPref !== 'anyone' && userData.gender !== u.genderPref) return false;
+    return true;
   });
-  const idx = tagIdx >= 0 ? tagIdx : 0;
-  return queue.splice(idx, 1)[0];
+
+  if (possibleMatchIdx >= 0) return queue.splice(possibleMatchIdx, 1)[0];
+  return null;
 };
 
 io.on('connection', async (socket) => {
@@ -316,7 +339,7 @@ io.on('connection', async (socket) => {
   connectedUsers.set(socket.id, { currentPartner: null, vibe: null, spark: false, ip: userIp, gender: null, tags: [], country: null, dareTimer: null, userId: null });
   broadcastOnlineCount();
 
-  socket.on('join_queue', ({ vibe, gender, tags, country, userId }) => {
+  socket.on('join_queue', async ({ vibe, gender, tags, country, userId, genderPref, location }) => {
     const user = connectedUsers.get(socket.id);
     if (!user || user.currentPartner) return;
 
@@ -326,6 +349,18 @@ io.on('connection', async (socket) => {
     user.country = country || null;
     user.spark = false;
     user.userId = userId;
+    user.genderPref = genderPref || 'anyone';
+    user.location = location || null;
+    
+    // Fetch total_spent for Wealth Rank
+    let totalSpent = 0;
+    if (userId) {
+      try {
+        const res = await db.query('SELECT total_spent FROM wallets WHERE user_id = $1', [userId]);
+        if (res.rows.length > 0) totalSpent = res.rows[0].total_spent || 0;
+      } catch (err) {}
+    }
+    user.totalSpent = totalSpent;
 
     const queue = queues[vibe];
     if (!queue) return;
@@ -348,8 +383,22 @@ io.on('connection', async (socket) => {
         user.currentPartner = partnerSocketId;
         partner.currentPartner = socket.id;
 
-        socket.emit('matched', { partnerId: partnerSocketId, partnerGender: partner.gender, partnerTags: partner.tags, partnerCountry: partner.country ? { code: partner.country } : null });
-        io.to(partnerSocketId).emit('matched', { partnerId: socket.id, partnerGender: user.gender, partnerTags: user.tags, partnerCountry: user.country ? { code: user.country } : null });
+        socket.emit('matched', { 
+          partnerId: partnerSocketId, 
+          partnerGender: partner.gender, 
+          partnerTags: partner.tags, 
+          partnerCountry: partner.country ? { code: partner.country } : null,
+          partnerWealthRank: getWealthRank(partner.totalSpent),
+          distanceKm: user.location && partner.location ? getDistance(user.location.lat, user.location.lng, partner.location.lat, partner.location.lng) : null
+        });
+        io.to(partnerSocketId).emit('matched', { 
+          partnerId: socket.id, 
+          partnerGender: user.gender, 
+          partnerTags: user.tags, 
+          partnerCountry: user.country ? { code: user.country } : null,
+          partnerWealthRank: getWealthRank(user.totalSpent),
+          distanceKm: user.location && partner.location ? getDistance(user.location.lat, user.location.lng, partner.location.lat, partner.location.lng) : null
+        });
 
 
         // Send dare card every 90s
