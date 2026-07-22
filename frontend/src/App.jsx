@@ -7,6 +7,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import './App.css';
 
 const SOCKET_SERVER_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+const RZP_KEY = import.meta.env.VITE_RAZORPAY_KEY_ID;
 
 // ── SPARK PACKAGES ─────────────────────────────────────────────────────────────
 const SPARK_PACKAGES = [
@@ -43,6 +44,16 @@ const popIn    = { hidden: { opacity: 0, scale: 0.85 }, show: { opacity: 1, scal
 const slideUp  = { hidden: { opacity: 0, y: 60 }, show: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 250, damping: 25 } } };
 const stagger  = { show: { transition: { staggerChildren: 0.08 } } };
 
+function loadRazorpay() {
+  return new Promise(resolve => {
+    if (window.Razorpay) return resolve(true);
+    const s = document.createElement('script');
+    s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    s.onload = () => resolve(true);
+    s.onerror = () => resolve(false);
+    document.body.appendChild(s);
+  });
+}
 
 const getFlagEmoji = (code) => {
   if (!code) return '🌍';
@@ -58,22 +69,54 @@ function SparkModal({ user, onClose, onSuccess }) {
     setLoading(pkg.id);
     setError('');
     try {
-      // Create a Stripe Checkout session on the backend
-      const res = await fetch(`${SOCKET_SERVER_URL}/api/create-checkout-session`, {
+      // Step 1: Create Razorpay order on backend (in USD)
+      const res = await fetch(`${SOCKET_SERVER_URL}/api/create-order`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          packageId: pkg.id,
-          userId: user.uid,
-          successUrl: `${window.location.origin}?payment=success&sparks=${pkg.sparks}`,
-          cancelUrl:  `${window.location.origin}?payment=cancelled`,
-        }),
+        body: JSON.stringify({ packageId: pkg.id }),
       });
-      const data = await res.json();
-      if (!data.url) throw new Error(data.error || 'Failed to create checkout session');
+      const order = await res.json();
+      if (!order.order_id) throw new Error(order.error || 'Failed to create order');
 
-      // Redirect to Stripe-hosted checkout page (secure, supports all cards + Apple/Google Pay)
-      window.location.href = data.url;
+      // Step 2: Load Razorpay checkout
+      await loadRazorpay();
+
+      // Step 3: Open Razorpay modal
+      const rzp = new window.Razorpay({
+        key: RZP_KEY,
+        amount: order.amount,
+        currency: order.currency, // 'USD'
+        name: 'ConnectSpark',
+        description: `${order.sparks} Sparks — ${order.label} Pack`,
+        order_id: order.order_id,
+        handler: async (response) => {
+          // Step 4: Verify on backend + credit Sparks
+          const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/verify-payment`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              razorpay_order_id:  response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_signature: response.razorpay_signature,
+              userId: user.uid,
+              packageId: pkg.id,
+            }),
+          });
+          const verifyData = await verifyRes.json();
+          if (verifyData.success) {
+            onSuccess(verifyData.new_balance, pkg.sparks);
+            onClose();
+          } else {
+            setError(verifyData.message || 'Verification failed');
+          }
+          setLoading(null);
+        },
+        modal: { ondismiss: () => setLoading(null) },
+        prefill: { name: user.displayName || 'ConnectSpark User', email: user.email || '' },
+        theme: { color: '#f43f5e' },
+      });
+      rzp.on('payment.failed', (e) => { setError(e.error.description); setLoading(null); });
+      rzp.open();
     } catch (err) {
       setError(err.message);
       setLoading(null);
