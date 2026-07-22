@@ -4,11 +4,49 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
-const Razorpay = require('razorpay');
-const crypto = require('crypto');
+const Stripe = require('stripe');
+
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 app.use(cors());
+
+// ── STRIPE WEBHOOK (must be before express.json()) ────────────────────────────
+// Stripe sends raw body — must NOT be parsed by express.json()
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('❌ Webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const { userId, packageId } = session.metadata;
+    const pkg = SPARK_PACKAGES[packageId];
+    if (!pkg || !userId) return res.json({ received: true });
+
+    try {
+      const result = await db.query(
+        `INSERT INTO wallets (user_id, balance, total_spent)
+         VALUES ($1, $2, 0)
+         ON CONFLICT (user_id)
+         DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()
+         RETURNING balance`,
+        [userId, pkg.sparks]
+      );
+      console.log(`✅ Stripe: Credited ${pkg.sparks} Sparks to ${userId} — balance: ${result.rows[0].balance}`);
+    } catch (err) {
+      console.error('❌ Failed to credit Sparks after Stripe payment:', err.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
 // ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -20,18 +58,12 @@ db.connect()
   .then(() => console.log('✅ Connected to PostgreSQL'))
   .catch(err => console.error('❌ Database error:', err.message));
 
-// ── RAZORPAY ──────────────────────────────────────────────────────────────────
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
-
 // ── SPARK PACKAGES ────────────────────────────────────────────────────────────
-// Amount in INR, sparks credited on successful payment
+// amount in USD cents (Stripe uses smallest currency unit)
 const SPARK_PACKAGES = {
-  starter: { amount: 49,  sparks: 50,  label: 'Starter' },
-  popular: { amount: 99,  sparks: 130, label: 'Popular'  },
-  pro:     { amount: 199, sparks: 300, label: 'Pro'       },
+  starter: { amount: 149,  sparks: 100,  label: 'Starter', priceLabel: '$1.49'  },
+  popular: { amount: 499,  sparks: 500,  label: 'Popular',  priceLabel: '$4.99'  },
+  whale:   { amount: 1499, sparks: 2000, label: 'Whale',    priceLabel: '$14.99' },
 };
 
 // ── TURN SERVER ────────────────────────────────────────────────────────────────
@@ -57,92 +89,41 @@ app.get('/api/turn-credentials', async (req, res) => {
   res.json({ iceServers });
 });
 
-// ── STEP 1: CREATE ORDER ───────────────────────────────────────────────────────
-// Frontend sends: { package: 'starter' | 'popular' | 'pro' }
-// Backend creates Razorpay order and returns order_id + package details
-app.post('/api/create-order', async (req, res) => {
-  const { package: pkg } = req.body;
-  const packageData = SPARK_PACKAGES[pkg];
+// ── STRIPE: CREATE CHECKOUT SESSION ──────────────────────────────────────────
+// Frontend sends: { packageId, userId, successUrl, cancelUrl }
+// Backend creates a Stripe Checkout Session URL — user is redirected there
+app.post('/api/create-checkout-session', async (req, res) => {
+  const { packageId, userId, successUrl, cancelUrl } = req.body;
+  const pkg = SPARK_PACKAGES[packageId];
 
-  if (!packageData) {
-    return res.status(400).json({ error: 'Invalid package. Choose starter, popular, or pro.' });
-  }
+  if (!pkg) return res.status(400).json({ error: 'Invalid package' });
+  if (!userId) return res.status(400).json({ error: 'User ID required' });
 
   try {
-    const order = await razorpay.orders.create({
-      amount: packageData.amount * 100, // Convert INR to paise
-      currency: 'INR',
-      receipt: `spark_${pkg}_${Date.now()}`,
-      notes: { package: pkg, sparks: packageData.sparks },
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `ConnectSpark — ${pkg.label} Pack`,
+            description: `${pkg.sparks} Sparks to spend on premium features`,
+            images: ['https://connectspark.metered.live/logo.png'],
+          },
+          unit_amount: pkg.amount, // in cents
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: successUrl || `${process.env.FRONTEND_URL}?payment=success&sparks=${pkg.sparks}`,
+      cancel_url:  cancelUrl  || `${process.env.FRONTEND_URL}?payment=cancelled`,
+      metadata: { userId, packageId, sparks: pkg.sparks },
     });
 
-    res.json({
-      order_id: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      package: pkg,
-      sparks: packageData.sparks,
-      label: packageData.label,
-    });
+    res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
-    console.error('❌ Create order error:', err);
-    res.status(500).json({ error: err.error?.description || err.message || 'Failed to create order' });
-  }
-});
-
-// ── STEP 2: VERIFY PAYMENT + CREDIT SPARKS ────────────────────────────────────
-// Frontend sends: { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, package }
-// Backend: verifies HMAC → credits Sparks → returns new balance
-app.post('/api/verify-payment', async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, package: pkg } = req.body;
-
-  // Validate fields
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !userId || !pkg) {
-    return res.status(400).json({ success: false, message: 'Missing required fields' });
-  }
-
-  // Validate package
-  const packageData = SPARK_PACKAGES[pkg];
-  if (!packageData) {
-    return res.status(400).json({ success: false, message: 'Invalid package' });
-  }
-
-  // ✅ HMAC-SHA256 Signature Verification
-  // This is the ONLY way to confirm the payment is real and not faked
-  const sign = razorpay_order_id + '|' + razorpay_payment_id;
-  const expectedSign = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-    .update(sign)
-    .digest('hex');
-
-  if (razorpay_signature !== expectedSign) {
-    console.warn(`⚠️  Signature mismatch for user ${userId} — possible fraud attempt`);
-    return res.status(400).json({ success: false, message: 'Payment signature mismatch — not verified' });
-  }
-
-  // ✅ Signature valid — credit Sparks atomically
-  try {
-    const result = await db.query(
-      `INSERT INTO wallets (user_id, balance)
-       VALUES ($1, $2)
-       ON CONFLICT (user_id)
-       DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()
-       RETURNING balance`,
-      [userId, packageData.sparks]
-    );
-
-    const newBalance = result.rows[0].balance;
-    console.log(`✅ Credited ${packageData.sparks} Sparks to ${userId} — new balance: ${newBalance}`);
-
-    res.json({
-      success: true,
-      message: `${packageData.sparks} Sparks added successfully!`,
-      sparks_added: packageData.sparks,
-      new_balance: newBalance,
-    });
-  } catch (err) {
-    console.error('❌ Credit Sparks error:', err);
-    res.status(500).json({ success: false, message: 'Payment verified but failed to credit Sparks. Contact support.' });
+    console.error('❌ Stripe checkout error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 

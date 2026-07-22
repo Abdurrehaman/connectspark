@@ -7,13 +7,12 @@ import { onAuthStateChanged } from 'firebase/auth';
 import './App.css';
 
 const SOCKET_SERVER_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-const RZP_KEY = import.meta.env.VITE_RAZORPAY_KEY_ID;
 
 // ── SPARK PACKAGES ─────────────────────────────────────────────────────────────
 const SPARK_PACKAGES = [
-  { id: 'starter', price: 1.49,  sparks: 100,  label: 'Starter',    badge: null,      color: '#38bdf8' },
-  { id: 'popular', price: 4.99,  sparks: 500,  label: 'Popular',    badge: '⭐ Best',  color: '#f43f5e' },
-  { id: 'pro',     price: 14.99, sparks: 2000, label: 'Whale',      badge: '🔥 Max',   color: '#a855f7' },
+  { id: 'starter', price: 1.49,  sparks: 100,  label: 'Starter', badge: null,      color: '#38bdf8' },
+  { id: 'popular', price: 4.99,  sparks: 500,  label: 'Popular', badge: '⭐ Best',  color: '#f43f5e' },
+  { id: 'whale',   price: 14.99, sparks: 2000, label: 'Whale',   badge: '🔥 Max',   color: '#a855f7' },
 ];
 
 const SPARK_COSTS = { super_spark: 20, premium_gift: 10 };
@@ -44,16 +43,6 @@ const popIn    = { hidden: { opacity: 0, scale: 0.85 }, show: { opacity: 1, scal
 const slideUp  = { hidden: { opacity: 0, y: 60 }, show: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 250, damping: 25 } } };
 const stagger  = { show: { transition: { staggerChildren: 0.08 } } };
 
-function loadRazorpay() {
-  return new Promise(resolve => {
-    if (window.Razorpay) return resolve(true);
-    const s = document.createElement('script');
-    s.src = 'https://checkout.razorpay.com/v1/checkout.js';
-    s.onload = () => resolve(true);
-    s.onerror = () => resolve(false);
-    document.body.appendChild(s);
-  });
-}
 
 const getFlagEmoji = (code) => {
   if (!code) return '🌍';
@@ -69,54 +58,22 @@ function SparkModal({ user, onClose, onSuccess }) {
     setLoading(pkg.id);
     setError('');
     try {
-      // Step 1: Create Razorpay order on backend
-      const res = await fetch(`${SOCKET_SERVER_URL}/api/create-order`, {
+      // Create a Stripe Checkout session on the backend
+      const res = await fetch(`${SOCKET_SERVER_URL}/api/create-checkout-session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ package: pkg.id }),
+        body: JSON.stringify({
+          packageId: pkg.id,
+          userId: user.uid,
+          successUrl: `${window.location.origin}?payment=success&sparks=${pkg.sparks}`,
+          cancelUrl:  `${window.location.origin}?payment=cancelled`,
+        }),
       });
-      const order = await res.json();
-      if (!order.order_id) throw new Error(order.error || 'Failed to create order');
+      const data = await res.json();
+      if (!data.url) throw new Error(data.error || 'Failed to create checkout session');
 
-      // Step 2: Load Razorpay checkout
-      await loadRazorpay();
-
-      // Step 3: Open Razorpay modal
-      const rzp = new window.Razorpay({
-        key: RZP_KEY,
-        amount: order.amount,
-        currency: order.currency,
-        name: 'ConnectSpark',
-        description: `${order.sparks} Sparks — ${order.label} Pack`,
-        order_id: order.order_id,
-        handler: async (response) => {
-          // Step 4: Verify on backend + credit Sparks
-          const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/verify-payment`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              razorpay_order_id:  response.razorpay_order_id,
-              razorpay_payment_id: response.razorpay_payment_id,
-              razorpay_signature: response.razorpay_signature,
-              userId: user.uid,
-              package: pkg.id,
-            }),
-          });
-          const verifyData = await verifyRes.json();
-          if (verifyData.success) {
-            onSuccess(verifyData.new_balance, pkg.sparks);
-            onClose();
-          } else {
-            setError(verifyData.message || 'Verification failed');
-          }
-          setLoading(null);
-        },
-        modal: { ondismiss: () => setLoading(null) },
-        prefill: { name: user.displayName || 'ConnectSpark User', email: user.email || '' },
-        theme: { color: '#f43f5e' },
-      });
-      rzp.on('payment.failed', (e) => { setError(e.error.description); setLoading(null); });
-      rzp.open();
+      // Redirect to Stripe-hosted checkout page (secure, supports all cards + Apple/Google Pay)
+      window.location.href = data.url;
     } catch (err) {
       setError(err.message);
       setLoading(null);
@@ -325,7 +282,7 @@ function App() {
         try {
           const r = await fetch(`${SOCKET_SERVER_URL}/api/sparks/${u.uid}`);
           const d = await r.json();
-          setSparks(1000); // Temporary: free 1000 sparks for testing
+          setSparks(d.sparks ?? 0);
         } catch {}
         // Fetch TURN credentials
         try {
@@ -345,9 +302,20 @@ function App() {
       .catch(() => {});
   }, []);
 
+  // Handle Stripe redirect back (payment success / cancelled)
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const params = new URLSearchParams(window.location.search);
+    const paymentStatus = params.get('payment');
+    const sparksAdded = parseInt(params.get('sparks') || '0', 10);
+    if (paymentStatus === 'success' && sparksAdded > 0) {
+      setSparks(prev => prev + sparksAdded);
+      // Clean URL without reload
+      window.history.replaceState({}, '', window.location.pathname);
+      setTimeout(() => alert(`✅ Payment successful! ${sparksAdded} Sparks added to your wallet ⚡`), 500);
+    } else if (paymentStatus === 'cancelled') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
 
   // Phone auth
   const setupRecaptcha = () => {
