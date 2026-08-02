@@ -4,7 +4,6 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
-const Razorpay = require('razorpay');
 const crypto = require('crypto');
 
 const app = express();
@@ -20,18 +19,28 @@ db.connect()
   .then(() => console.log('✅ Connected to PostgreSQL'))
   .catch(err => console.error('❌ Database error:', err.message));
 
-// ── RAZORPAY ──────────────────────────────────────────────────────────────────
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+// ── PAYPAL ────────────────────────────────────────────────────────────────────
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+const PAYPAL_API_BASE = 'https://api-m.sandbox.paypal.com'; // Use sandbox for testing
+
+async function generatePayPalAccessToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    body: 'grant_type=client_credentials',
+    headers: { Authorization: `Basic ${auth}` },
+  });
+  const data = await response.json();
+  return data.access_token;
+}
 
 // ── SPARK PACKAGES ────────────────────────────────────────────────────────────
-// amount in USD cents (Razorpay will process in USD and settle in INR)
+// amount in USD (PayPal takes strings like '1.49')
 const SPARK_PACKAGES = {
-  starter: { amount: 149,  sparks: 100,  label: 'Starter', priceLabel: '$1.49'  },
-  popular: { amount: 499,  sparks: 500,  label: 'Popular',  priceLabel: '$4.99'  },
-  whale:   { amount: 1499, sparks: 2000, label: 'Whale',    priceLabel: '$14.99' },
+  starter: { amount: '1.49',  sparks: 100,  label: 'Starter', priceLabel: '$1.49'  },
+  popular: { amount: '4.99',  sparks: 500,  label: 'Popular',  priceLabel: '$4.99'  },
+  whale:   { amount: '14.99', sparks: 2000, label: 'Whale',    priceLabel: '$14.99' },
 };
 
 // ── TURN SERVER ────────────────────────────────────────────────────────────────
@@ -57,83 +66,89 @@ app.get('/api/turn-credentials', async (req, res) => {
   res.json({ iceServers });
 });
 
-// ── STEP 1: CREATE ORDER ───────────────────────────────────────────────────────
-// Frontend sends: { package: 'starter' | 'popular' | 'whale' }
-// Backend creates Razorpay order and returns order_id + package details
+// ── STEP 1: CREATE PAYPAL ORDER ────────────────────────────────────────────────
+// Frontend sends: { packageId }
 app.post('/api/create-order', async (req, res) => {
   const { packageId } = req.body;
   const packageData = SPARK_PACKAGES[packageId];
-
-  if (!packageData) {
-    return res.status(400).json({ error: 'Invalid package.' });
-  }
+  if (!packageData) return res.status(400).json({ error: 'Invalid package.' });
 
   try {
-    const order = await razorpay.orders.create({
-      amount: packageData.amount, // already in cents
-      currency: 'USD',
-      receipt: `spark_${packageId}_${Date.now()}`,
-      notes: { packageId: packageId, sparks: packageData.sparks },
+    const accessToken = await generatePayPalAccessToken();
+    const url = `${PAYPAL_API_BASE}/v2/checkout/orders`;
+    const payload = {
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: `spark_${packageId}_${Date.now()}`,
+          amount: { currency_code: 'USD', value: packageData.amount },
+          description: `${packageData.sparks} Sparks — ${packageData.label} Pack`
+        },
+      ],
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(payload),
     });
 
-    res.json({
-      order_id: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      packageId: packageId,
-      sparks: packageData.sparks,
-      label: packageData.label,
-    });
+    const data = await response.json();
+    if (data.id) {
+      res.json({ id: data.id, sparks: packageData.sparks });
+    } else {
+      res.status(500).json({ error: 'Failed to create PayPal order', details: data });
+    }
   } catch (err) {
     console.error('❌ Create order error:', err);
-    res.status(500).json({ error: err.error?.description || err.message || 'Failed to create order' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── STEP 2: VERIFY PAYMENT + CREDIT SPARKS ────────────────────────────────────
-app.post('/api/verify-payment', async (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, packageId } = req.body;
-
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !userId || !packageId) {
-    return res.status(400).json({ success: false, message: 'Missing required fields' });
+// ── STEP 2: CAPTURE PAYPAL ORDER + CREDIT SPARKS ──────────────────────────────
+app.post('/api/capture-order', async (req, res) => {
+  const { orderID, userId, packageId } = req.body;
+  if (!orderID || !userId || !packageId) {
+    return res.status(400).json({ success: false, message: 'Missing fields' });
   }
 
   const packageData = SPARK_PACKAGES[packageId];
-  if (!packageData) {
-    return res.status(400).json({ success: false, message: 'Invalid package' });
-  }
+  if (!packageData) return res.status(400).json({ success: false, message: 'Invalid package' });
 
-  // ✅ HMAC-SHA256 Signature Verification
-  const sign = razorpay_order_id + '|' + razorpay_payment_id;
-  const expectedSign = crypto
-    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-    .update(sign)
-    .digest('hex');
-
-  if (razorpay_signature !== expectedSign) {
-    console.warn(`⚠️ Signature mismatch for user ${userId}`);
-    return res.status(400).json({ success: false, message: 'Payment signature mismatch' });
-  }
-
-  // ✅ Valid — credit Sparks
   try {
-    const result = await db.query(
-      `INSERT INTO wallets (user_id, balance, total_spent)
-       VALUES ($1, $2, 0)
-       ON CONFLICT (user_id)
-       DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()
-       RETURNING balance`,
-      [userId, packageData.sparks]
-    );
-
-    res.json({
-      success: true,
-      sparks_added: packageData.sparks,
-      new_balance: result.rows[0].balance,
+    const accessToken = await generatePayPalAccessToken();
+    const url = `${PAYPAL_API_BASE}/v2/checkout/orders/${orderID}/capture`;
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
     });
+    
+    const data = await response.json();
+
+    if (data.status === 'COMPLETED') {
+      // ✅ Valid — credit Sparks
+      const result = await db.query(
+        `INSERT INTO wallets (user_id, balance, total_spent)
+         VALUES ($1, $2, 0)
+         ON CONFLICT (user_id)
+         DO UPDATE SET balance = wallets.balance + $2, updated_at = NOW()
+         RETURNING balance`,
+        [userId, packageData.sparks]
+      );
+
+      res.json({
+        success: true,
+        sparks_added: packageData.sparks,
+        new_balance: result.rows[0].balance,
+      });
+    } else {
+      console.warn(`⚠️ PayPal Capture failed or not completed:`, data);
+      res.status(400).json({ success: false, message: 'Payment not completed' });
+    }
   } catch (err) {
-    console.error('❌ Credit Sparks error:', err);
-    res.status(500).json({ success: false, message: 'Failed to credit Sparks' });
+    console.error('❌ Capture Order error:', err);
+    res.status(500).json({ success: false, message: 'Failed to capture order' });
   }
 });
 

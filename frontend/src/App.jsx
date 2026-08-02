@@ -4,10 +4,11 @@ import io from 'socket.io-client';
 import { Send, SkipForward, AlertTriangle, Video, VideoOff, Mic, MicOff, Zap, Gift, Globe, LogOut, Sparkles, Star } from 'lucide-react';
 import { auth, signInWithGoogle, logOut, RecaptchaVerifier, signInWithPhoneNumber } from './firebase';
 import { onAuthStateChanged } from 'firebase/auth';
+import { PayPalScriptProvider, PayPalButtons } from '@paypal/react-paypal-js';
 import './App.css';
 
 const SOCKET_SERVER_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-const RZP_KEY = import.meta.env.VITE_RAZORPAY_KEY_ID;
+const PAYPAL_CLIENT_ID = import.meta.env.VITE_PAYPAL_CLIENT_ID;
 
 // ── SPARK PACKAGES ─────────────────────────────────────────────────────────────
 const SPARK_PACKAGES = [
@@ -44,17 +45,6 @@ const popIn    = { hidden: { opacity: 0, scale: 0.85 }, show: { opacity: 1, scal
 const slideUp  = { hidden: { opacity: 0, y: 60 }, show: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 250, damping: 25 } } };
 const stagger  = { show: { transition: { staggerChildren: 0.08 } } };
 
-function loadRazorpay() {
-  return new Promise(resolve => {
-    if (window.Razorpay) return resolve(true);
-    const s = document.createElement('script');
-    s.src = 'https://checkout.razorpay.com/v1/checkout.js';
-    s.onload = () => resolve(true);
-    s.onerror = () => resolve(false);
-    document.body.appendChild(s);
-  });
-}
-
 const getFlagEmoji = (code) => {
   if (!code) return '🌍';
   return code.toUpperCase().replace(/./g, c => String.fromCodePoint(127397 + c.charCodeAt()));
@@ -62,104 +52,88 @@ const getFlagEmoji = (code) => {
 
 // ── SPARK PURCHASE MODAL ───────────────────────────────────────────────────────
 function SparkModal({ user, onClose, onSuccess }) {
-  const [loading, setLoading] = useState(null);
-  const [error, setError]     = useState('');
+  const [selectedPkg, setSelectedPkg] = useState(null);
+  const [error, setError] = useState('');
 
-  const handleBuy = async (pkg) => {
-    setLoading(pkg.id);
+  const createPayPalOrder = async (data, actions) => {
     setError('');
-    try {
-      // Step 1: Create Razorpay order on backend (in USD)
-      const res = await fetch(`${SOCKET_SERVER_URL}/api/create-order`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageId: pkg.id }),
-      });
-      const order = await res.json();
-      if (!order.order_id) throw new Error(order.error || 'Failed to create order');
+    const res = await fetch(`${SOCKET_SERVER_URL}/api/create-order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ packageId: selectedPkg.id }),
+    });
+    const orderData = await res.json();
+    if (!orderData.id) {
+      setError(orderData.error || 'Failed to create PayPal order');
+      throw new Error('Failed to create order');
+    }
+    return orderData.id;
+  };
 
-      // Step 2: Load Razorpay checkout
-      await loadRazorpay();
-
-      // Step 3: Open Razorpay modal
-      const rzp = new window.Razorpay({
-        key: RZP_KEY,
-        amount: order.amount,
-        currency: order.currency, // 'USD'
-        name: 'ConnectSpark',
-        description: `${order.sparks} Sparks — ${order.label} Pack`,
-        order_id: order.order_id,
-        handler: async (response) => {
-          // Step 4: Verify on backend + credit Sparks
-          const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/verify-payment`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              razorpay_order_id:  response.razorpay_order_id,
-              razorpay_payment_id: response.razorpay_payment_id,
-              razorpay_signature: response.razorpay_signature,
-              userId: user.uid,
-              packageId: pkg.id,
-            }),
-          });
-          const verifyData = await verifyRes.json();
-          if (verifyData.success) {
-            onSuccess(verifyData.new_balance, pkg.sparks);
-            onClose();
-          } else {
-            setError(verifyData.message || 'Verification failed');
-          }
-          setLoading(null);
-        },
-        modal: { ondismiss: () => setLoading(null) },
-        prefill: { name: user.displayName || 'ConnectSpark User', email: user.email || '' },
-        theme: { color: '#f43f5e' },
-      });
-      rzp.on('payment.failed', (e) => { setError(e.error.description); setLoading(null); });
-      rzp.open();
-    } catch (err) {
-      setError(err.message);
-      setLoading(null);
+  const onPayPalApprove = async (data, actions) => {
+    const verifyRes = await fetch(`${SOCKET_SERVER_URL}/api/capture-order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        orderID: data.orderID,
+        userId: user.uid,
+        packageId: selectedPkg.id,
+      }),
+    });
+    const verifyData = await verifyRes.json();
+    if (verifyData.success) {
+      onSuccess(verifyData.new_balance, selectedPkg.sparks);
+      onClose();
+    } else {
+      setError(verifyData.message || 'Verification failed');
     }
   };
 
   return (
-    <motion.div className="modal-backdrop" variants={fadeIn} initial="hidden" animate="show" onClick={onClose}>
-      <motion.div className="spark-modal" variants={popIn} onClick={e => e.stopPropagation()}>
-        <div className="modal-glow" />
-        <button className="modal-close" onClick={onClose}>✕</button>
-        <div className="modal-header">
-          <span className="modal-icon">⚡</span>
-          <h2>Buy Sparks</h2>
-          <p>Spend Sparks on Super Spark & premium gifts</p>
-        </div>
+    <PayPalScriptProvider options={{ "client-id": PAYPAL_CLIENT_ID, currency: "USD", intent: "capture" }}>
+      <motion.div className="modal-backdrop" variants={fadeIn} initial="hidden" animate="show" onClick={onClose}>
+        <motion.div className="spark-modal" variants={popIn} onClick={e => e.stopPropagation()}>
+          <div className="modal-glow" />
+          <button className="modal-close" onClick={onClose}>✕</button>
+          <div className="modal-header">
+            <span className="modal-icon">⚡</span>
+            <h2>Buy Sparks</h2>
+            <p>Select a package below to checkout with PayPal</p>
+          </div>
 
-        <motion.div className="packages-grid" variants={stagger} initial="hidden" animate="show">
-          {SPARK_PACKAGES.map(pkg => (
-            <motion.div
-              key={pkg.id}
-              variants={fadeUp}
-              className={`package-card ${pkg.badge ? 'package-popular' : ''}`}
-              style={{ '--pkg-color': pkg.color }}
-              whileHover={{ scale: 1.04, y: -4 }}
-              whileTap={{ scale: 0.97 }}
-            >
-              {pkg.badge && <div className="pkg-badge">{pkg.badge}</div>}
-              <div className="pkg-sparks">⚡ {pkg.sparks}</div>
-              <div className="pkg-label">{pkg.label}</div>
-              <div className="pkg-price">${pkg.price}</div>
-              <motion.button
-                className="pkg-buy-btn"
-                onClick={() => handleBuy(pkg)}
-                disabled={loading === pkg.id}
-                whileHover={{ scale: 1.05 }}
-                whileTap={{ scale: 0.95 }}
+          <motion.div className="packages-grid" variants={stagger} initial="hidden" animate="show">
+            {SPARK_PACKAGES.map(pkg => (
+              <motion.div
+                key={pkg.id}
+                variants={fadeUp}
+                className={`package-card ${pkg.badge ? 'package-popular' : ''} ${selectedPkg?.id === pkg.id ? 'selected' : ''}`}
+                style={{ '--pkg-color': pkg.color, cursor: 'pointer', border: selectedPkg?.id === pkg.id ? `2px solid ${pkg.color}` : '2px solid transparent' }}
+                whileHover={{ scale: 1.04, y: -4 }}
+                whileTap={{ scale: 0.97 }}
+                onClick={() => setSelectedPkg(pkg)}
               >
-                {loading === pkg.id ? '...' : `Buy $${pkg.price}`}
-              </motion.button>
-            </motion.div>
-          ))}
-        </motion.div>
+                {pkg.badge && <div className="pkg-badge">{pkg.badge}</div>}
+                <div className="pkg-sparks">⚡ {pkg.sparks}</div>
+                <div className="pkg-label">{pkg.label}</div>
+                <div className="pkg-price">${pkg.price}</div>
+              </motion.div>
+            ))}
+          </motion.div>
+
+          <div style={{ marginTop: '20px', minHeight: '150px' }}>
+            {selectedPkg ? (
+              <PayPalButtons 
+                key={selectedPkg.id} 
+                createOrder={createPayPalOrder} 
+                onApprove={onPayPalApprove} 
+                onError={(err) => setError('PayPal Error: ' + err.message)}
+                style={{ layout: "vertical", shape: "pill", color: "gold" }}
+              />
+            ) : (
+              <div style={{ textAlign: 'center', opacity: 0.5 }}>Please select a package</div>
+            )}
+            {error && <div className="error-text" style={{ textAlign: 'center', marginTop: '10px' }}>{error}</div>}
+          </div>
 
         <div className="spark-spends">
           <p>What Sparks unlock:</p>
@@ -172,6 +146,7 @@ function SparkModal({ user, onClose, onSuccess }) {
         {error && <motion.p className="modal-error" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>❌ {error}</motion.p>}
       </motion.div>
     </motion.div>
+  </PayPalScriptProvider>
   );
 }
 
